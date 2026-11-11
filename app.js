@@ -21,6 +21,19 @@ const SCHEDULE_STORAGE_KEY = "robo-schedule-v1";
 const CALENDAR_STORAGE_KEY = "robo-calendar-v1";
 const TIMETABLE_STORAGE_KEY = "robo-timetable-v1";
 const ALARM_STORAGE_KEY = "robo-alarms-v1";
+const MAX_TIMER_SECONDS = 5 * 60 * 60;
+const ALARM_SOUNDS = [
+  { id: "classic", name: "Classic chime", wave: "sine", notes: [523, 659, 784, 659] },
+  { id: "bright", name: "Bright bells", wave: "sine", notes: [784, 988, 1175, 988] },
+  { id: "digital", name: "Digital pulse", wave: "square", notes: [660, 880, 660, 1047] },
+  { id: "marimba", name: "Marimba", wave: "triangle", notes: [392, 523, 659, 523] },
+  { id: "rising", name: "Rising tones", wave: "sine", notes: [392, 494, 587, 698, 880] },
+  { id: "soft", name: "Soft waves", wave: "sine", notes: [440, 554, 440, 554] },
+  { id: "woodblock", name: "Woodblock", wave: "triangle", notes: [880, 660, 880, 660] },
+  { id: "chords", name: "Gentle chords", wave: "sine", notes: [523, 659, 784, 1047, 784, 659] },
+  { id: "sparkle", name: "Sparkle", wave: "triangle", notes: [1047, 1319, 1568, 1319] },
+  { id: "double-beep", name: "Double beep", wave: "square", notes: [740, 740, 988, 988] }
+];
 const TIMETABLE_DAYS = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"];
 const TIMETABLE_ROW_TIMES = ["08:00", "09:00", "10:00", "11:00", "12:00", "13:00", "14:00", "15:00", "16:00", "17:00", "18:00"];
 const DEFAULT_TIMETABLE = TIMETABLE_ROW_TIMES.map((time, index) => ({
@@ -37,7 +50,8 @@ let conversations = loadStored(CHAT_STORAGE_KEY, []);
 let students = loadStored(STUDENTS_STORAGE_KEY, []);
 let authState = { signedIn: false, provider: "Guest", displayName: "Guest", email: "" };
 let oauthConfig = null;
-let settings = loadStored(SETTINGS_STORAGE_KEY, { theme: "light", responseStyle: "balanced" });
+let settings = loadStored(SETTINGS_STORAGE_KEY, { theme: "light", responseStyle: "balanced", alarmSound: "classic" });
+if (!ALARM_SOUNDS.some(sound => sound.id === settings.alarmSound)) settings.alarmSound = "classic";
 let timetableEntries = loadStored(TIMETABLE_STORAGE_KEY, DEFAULT_TIMETABLE);
 let alarmEntries = loadStored(ALARM_STORAGE_KEY, [
   { id: "alarm-1", when: "2026-11-11T07:30", label: "Wake-up review", ringing: false },
@@ -52,6 +66,9 @@ let stopwatchHandle = null;
 let timerRemainingMs = 0;
 let timerHandle = null;
 let timerRunning = false;
+let alarmAudioContext = null;
+let activeAlarmOscillators = [];
+let alarmSoundTimeout = null;
 let lastTimetableAnnouncement = null;
 let scheduleItems = loadStored(SCHEDULE_STORAGE_KEY, [
   { id: "schedule-1", title: "Freshwater swamp review", date: "2026-11-12", time: "09:00", notes: "Summarize the habitat and biodiversity connections." },
@@ -215,13 +232,48 @@ function renderConversation() {
       const avatar = document.createElement("span");
       avatar.className = "robo-avatar message-avatar";
       avatar.setAttribute("aria-hidden", "true");
-      avatar.textContent = "R";
+      const icon = document.createElement("img");
+      icon.className = "robo-icon";
+      icon.src = "robo-icon.ico";
+      icon.alt = "";
+      avatar.append(icon);
       bubble.append(avatar);
     }
     const text = document.createElement("p");
     text.className = "message-text";
     text.textContent = message.text;
     bubble.append(text);
+    const hasGeneratedImage = typeof message.imageData === "string" || (typeof message.imageSvg === "string" && message.imageSvg.startsWith("<svg "));
+    if (hasGeneratedImage) {
+      const artwork = document.createElement("div");
+      artwork.className = "generated-artwork";
+      const image = document.createElement("img");
+      image.alt = `Illustration: ${message.imagePrompt || message.text}`;
+      const imageMimeType = message.imageMimeType || "image/png";
+      image.src = typeof message.imageData === "string"
+        ? `data:${imageMimeType};base64,${message.imageData}`
+        : `data:image/svg+xml;charset=utf-8,${encodeURIComponent(message.imageSvg)}`;
+      artwork.append(image);
+      const download = document.createElement("button");
+      download.type = "button";
+      download.className = "artwork-download";
+      download.textContent = typeof message.imageData === "string" ? "Download image" : "Download SVG";
+      download.addEventListener("click", () => {
+        const imageBytes = typeof message.imageData === "string"
+          ? Uint8Array.from(atob(message.imageData), character => character.charCodeAt(0))
+          : null;
+        const file = new Blob([imageBytes || message.imageSvg], { type: imageBytes ? imageMimeType : "image/svg+xml;charset=utf-8" });
+        const url = URL.createObjectURL(file);
+        const link = document.createElement("a");
+        link.href = url;
+        const extension = imageMimeType === "image/jpeg" ? "jpg" : imageMimeType === "image/webp" ? "webp" : imageBytes ? "png" : "svg";
+        link.download = `${(message.imagePrompt || "robo-illustration").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 48) || "robo-illustration"}.${extension}`;
+        link.click();
+        setTimeout(() => URL.revokeObjectURL(url), 1000);
+      });
+      artwork.append(download);
+      bubble.append(artwork);
+    }
     if (message.explorationId) {
       const item = explorations.find(exploration => exploration.id === message.explorationId);
       if (item) {
@@ -264,7 +316,173 @@ function findExploration(message) {
   return matches[0]?.item || null;
 }
 
-function showChatStatus(message, retry = false) {
+function getImagePrompt(message) {
+  if (!/\b(?:image|picture|illustration|drawing|artwork|art)\b/i.test(message) &&
+      !/^\s*(?:please\s+)?(?:draw|illustrate)\b/i.test(message)) return null;
+  if (/^\s*(?:can|could|would)\s+you\b/i.test(message) &&
+      /\b(?:as i describe|from my description|as i tell you)\b/i.test(message) &&
+      !/\b(?:of|with|wearing|showing|depicting|featuring)\b/i.test(message)) return null;
+  const prompt = message
+    .replace(/^\s*(?:can|could|would)\s+you\s+(?:please\s+)?/i, "")
+    .replace(/^\s*(?:please\s+)?(?:create|make|draw|generate|illustrate)\s+(?:me\s+)?/i, "")
+    .replace(/^(?:an?\s+)?(?:image|picture|illustration|drawing|artwork|art)\s+(?:of\s+)?/i, "")
+    .replace(/^(?:for me\s+)?(?:as|while)\s+i\s+(?:describe|explain|tell you)\b.*$/i, "")
+    .replace(/^(?:for me|please|now|of|for)\s+/i, "")
+    .replace(/^of\s+/i, "")
+    .trim();
+  if (!prompt || /^(?:for me|as i describe it|as i describe|whatever i describe)$/i.test(prompt)) return null;
+  return prompt;
+}
+
+function vectorIllustration(prompt) {
+  const animals = ["fox", "cat", "dog", "rabbit", "bear", "owl", "bird", "deer"];
+  const subject = animals.find(animal => new RegExp(`\\b${animal}(?:s|es)?\\b`, "i").test(prompt));
+  const isGirl = /\b(girl|woman|lady)\b/i.test(prompt);
+  const isBoy = /\b(boy|man)\b/i.test(prompt);
+  const isPerson = isGirl || isBoy || /\b(person|child|human)\b/i.test(prompt);
+  const isVillage = /\b(village|villages|hut|huts|thatched)\b/i.test(prompt);
+  const wantsGreenery = /\b(greenery|greenary|green|trees?|plants?|bushes|garden)\b/i.test(prompt);
+  const colorNames = {
+    red: "#cf4e38", orange: "#dc783f", golden: "#d7a648", yellow: "#e5bd45",
+    green: "#4c8c58", blue: "#4f82bc", purple: "#8564a7", pink: "#d67591",
+    white: "#f0ece1", gray: "#8b9094", grey: "#8b9094", brown: "#956344",
+    black: "#282b31"
+  };
+  const colorPattern = Object.keys(colorNames).join("|");
+  const subjectColorMatch = prompt.match(new RegExp(`\\b(${colorPattern})\\s+(?:[a-z-]+\\s+){0,1}${subject}s?\\b`, "i"));
+  const animalColor = subjectColorMatch ? colorNames[subjectColorMatch[1].toLowerCase()] : (subject === "fox" ? "#d8753f" : "#b77a51");
+  const hatMatch = prompt.match(new RegExp(`\\b(${colorPattern})\\s+(?:[a-z-]+\\s+){0,1}(?:hat|cap)\\b`, "i"));
+  const hatColor = hatMatch ? colorNames[hatMatch[1].toLowerCase()] : "#292d33";
+  const hasHat = /\b(?:hat|cap)\b/i.test(prompt);
+  const dressMatch = prompt.match(new RegExp(`\\b(${colorPattern})\\s+(?:[a-z-]+\\s+){0,1}(?:frock|dress|gown|skirt)\\b`, "i"));
+  const dressColor = dressMatch ? colorNames[dressMatch[1].toLowerCase()] : "#8564a7";
+  const shirtMatch = prompt.match(new RegExp(`\\b(${colorPattern})\\s+(?:[a-z-]+\\s+){0,1}(?:shirt|top|jacket|sweater)\\b`, "i"));
+  const shirtColor = shirtMatch ? colorNames[shirtMatch[1].toLowerCase()] : "#4f82bc";
+  const hairColorMatch = prompt.match(/\b(blond|blonde|black|brown|red|gray|grey)\s+hair\b/i);
+  const hairColor = hairColorMatch ? (hairColorMatch[1].toLowerCase().startsWith("blond") ? "#d7ad57" : colorNames[hairColorMatch[1].toLowerCase()] || "#49332e") : "#49332e";
+  const skinTone = /\b(dark|deep|brown)\s+skin\b/i.test(prompt) ? "#8f5b43" : /\b(fair|light)\s+skin\b/i.test(prompt) ? "#f0c6a6" : "#d99b76";
+  const night = /\b(night|moon|stars|space|dark)\b/i.test(prompt);
+  const sceneId = `art-${Math.random().toString(36).slice(2, 9)}`;
+  const skyTop = night ? "#18243d" : "#a8d7dc";
+  const skyBottom = night ? "#566183" : "#f7d6a1";
+  const ground = night ? "#354355" : "#829b6a";
+  const face = isPerson
+    ? `${isGirl ? `<path d="M263 161q-12-63 49-83 70-12 82 59l-5 98-30 6-7-80-77 0-5 79-31-5Z" fill="${hairColor}"/>` : `<path d="M267 137 260 111l25 13 12-29 22 19 24-19 9 28 25-12-9 49-27-23-27 8-28-8Z" fill="${hairColor}"/>`}<circle cx="314" cy="157" r="48" fill="${skinTone}"/><path d="M266 148q4-55 54-60 53 5 61 61-28-28-56-26-26 20-59 25Z" fill="${hairColor}"/><circle cx="297" cy="161" r="4" fill="#302b2a"/><circle cx="331" cy="161" r="4" fill="#302b2a"/><path d="M302 181q12 10 24 0" fill="none" stroke="#984f51" stroke-width="3" stroke-linecap="round"/>`
+    : isVillage
+      ? `<g><path d="M55 231 167 141l112 90v112H55Z" fill="#d9bd8f"/><path d="m38 235 129-110 130 110-18 17-112-93-111 93Z" fill="#956344"/><rect x="142" y="278" width="48" height="65" rx="18" fill="#77563e"/><rect x="77" y="256" width="34" height="32" fill="#a8d7dc" stroke="#77563e" stroke-width="6"/><path d="M363 231 475 141l112 90v112H363Z" fill="#d9bd8f"/><path d="m346 235 129-110 130 110-18 17-112-93-111 93Z" fill="#956344"/><rect x="450" y="278" width="48" height="65" rx="18" fill="#77563e"/><rect x="385" y="256" width="34" height="32" fill="#a8d7dc" stroke="#77563e" stroke-width="6"/>${wantsGreenery ? `<g fill="#4c8c58"><circle cx="37" cy="284" r="35"/><circle cx="35" cy="247" r="25"/><path d="M31 280h12v73H31Z" fill="#805a3b"/><circle cx="603" cy="279" r="38"/><circle cx="606" cy="239" r="28"/><path d="M600 277h12v76h-12Z" fill="#805a3b"/><circle cx="315" cy="318" r="17"/><circle cx="337" cy="325" r="13"/><circle cx="305" cy="331" r="10"/></g>` : ""}</g>`
+    : !subject
+      ? `<g>${/\b(flower|flowers|rose|tulip)\b/i.test(prompt) ? `<path d="M315 284v86m0-45q-43-30-52 2 31 16 52 6m0 12q38-32 54-4-24 23-54 15" fill="none" stroke="#4c8c58" stroke-width="10" stroke-linecap="round"/><g fill="#d67591"><ellipse cx="315" cy="185" rx="20" ry="50"/><ellipse cx="315" cy="185" rx="20" ry="50" transform="rotate(72 315 185)"/><ellipse cx="315" cy="185" rx="20" ry="50" transform="rotate(144 315 185)"/><ellipse cx="315" cy="185" rx="20" ry="50" transform="rotate(216 315 185)"/><ellipse cx="315" cy="185" rx="20" ry="50" transform="rotate(288 315 185)"/><circle cx="315" cy="185" r="20" fill="#e5bd45"/></g>`
+        : /\b(castle|house|home|cottage|building)\b/i.test(prompt) ? (/\bcastle\b/i.test(prompt) ? `<path d="M203 202h52v-66l28 22 28-22v66h59v-66l28 22 28-22v66h32v153H203Z" fill="#d7c6a6"/><path d="M203 202h52v-66l28 22 28-22v66m59 0v-66l28 22 28-22v66" fill="none" stroke="#a78b6b" stroke-width="8"/><path d="M290 355v-77q24-40 48 0v77" fill="#6a7180"/><g fill="#a8d7dc"><rect x="224" y="231" width="19" height="31"/><rect x="267" y="221" width="18" height="27"/><rect x="349" y="221" width="18" height="27"/><rect x="391" y="231" width="19" height="31"/></g>` : `<path d="m210 220 104-84 106 84v116H210Z" fill="#f2d4a0"/><path d="m190 224 124-103 127 103-17 19-110-90-108 90Z" fill="#b65d4d"/><rect x="285" y="270" width="57" height="66" rx="4" fill="#6c85a5"/><rect x="229" y="244" width="37" height="37" fill="#a8d7dc"/><rect x="358" y="244" width="37" height="37" fill="#a8d7dc"/>`)
+          : /\b(car|truck|bus|vehicle)\b/i.test(prompt) ? `<path d="m192 281 34-62q9-17 27-17h115q19 0 29 18l31 61v49H192Z" fill="#4f82bc"/><path d="m244 211-29 54h175l-26-54Z" fill="#bde0e4"/><circle cx="249" cy="330" r="26" fill="#303941"/><circle cx="367" cy="330" r="26" fill="#303941"/><circle cx="249" cy="330" r="11" fill="#d8e0de"/><circle cx="367" cy="330" r="11" fill="#d8e0de"/>`
+            : /\b(tree|forest|woods)\b/i.test(prompt) ? `<path d="M293 238h43v123h-43Z" fill="#805a3b"/><path d="M314 102 224 257h180Z" fill="#4c8c58"/><path d="m314 151-79 130h158Z" fill="#639b63"/><circle cx="267" cy="231" r="35" fill="#78a96c"/><circle cx="359" cy="224" r="38" fill="#5a965f"/>`
+              : /\b(planet|earth|moon|saturn|jupiter|mars)\b/i.test(prompt) ? `<circle cx="314" cy="215" r="105" fill="${/\b(earth)\b/i.test(prompt) ? "#4f82bc" : "#d7a648"}"/><path d="M222 211q43-43 81-2t96-9M245 263q38-32 72 0t69-4" fill="none" stroke="${/\b(earth)\b/i.test(prompt) ? "#4c8c58" : "#b8774b"}" stroke-width="24" stroke-linecap="round" opacity=".8"/>${/\b(saturn)\b/i.test(prompt) ? `<ellipse cx="314" cy="215" rx="147" ry="37" fill="none" stroke="#e4c78c" stroke-width="15" transform="rotate(-16 314 215)"/>` : ""}`
+                : /\b(mountain|mountains|landscape|ocean|sea|beach|waterfall)\b/i.test(prompt) ? `<path d="m110 320 147-190 133 190Z" fill="#8298a7"/><path d="m257 130 40 56-46-17-35 45Z" fill="#f0ece1"/><path d="m300 320 131-158 123 158Z" fill="#677f78"/><path d="M0 322q91-26 182 0t183 0 275 0v118H0Z" fill="${/\b(ocean|sea|beach|waterfall)\b/i.test(prompt) ? "#4f91a2" : "#718b65"}"/>`
+                  : /\b(rocket|spaceship|spacecraft)\b/i.test(prompt) ? `<path d="M314 106q78 71 55 194l-55 51-55-51q-23-123 55-194Z" fill="#d9e3e3"/><path d="M259 269 212 316l52 6m112-53 47 47-52 6" fill="#cf4e38"/><circle cx="314" cy="218" r="23" fill="#4f82bc" stroke="#fff" stroke-width="7"/><path d="m291 348 23 43 23-43" fill="#e5a944"/>`
+                    : `<circle cx="314" cy="220" r="94" fill="${colorNames[(prompt.match(new RegExp(`\\b(${colorPattern})\\b`, "i")) || [])[1]?.toLowerCase()] || "#d7a648"}"/>`}</g>`
+      : subject === "fox"
+    ? `<path d="M259 169 247 103 298 143 329 131 367 102 361 174Z" fill="${animalColor}"/><path d="m257 132 2 38 29-24Z" fill="#f3b4a0"/><path d="m347 146 28-29-8 51Z" fill="#f3b4a0"/><ellipse cx="314" cy="183" rx="66" ry="56" fill="${animalColor}"/><path d="M268 197q45 50 91 0-5 50-45 54-41-4-46-54" fill="#f5eee2"/><ellipse cx="314" cy="218" rx="13" ry="9" fill="#34353a"/><ellipse cx="291" cy="184" rx="5" ry="7" fill="#282b31"/><ellipse cx="338" cy="184" rx="5" ry="7" fill="#282b31"/>`
+    : subject === "rabbit"
+      ? `<ellipse cx="285" cy="135" rx="20" ry="74" transform="rotate(-13 285 135)" fill="${animalColor}"/><ellipse cx="342" cy="133" rx="20" ry="75" transform="rotate(12 342 133)" fill="${animalColor}"/><ellipse cx="285" cy="137" rx="9" ry="50" transform="rotate(-13 285 137)" fill="#e9b3a5"/><ellipse cx="342" cy="135" rx="9" ry="50" transform="rotate(12 342 135)" fill="#e9b3a5"/><ellipse cx="314" cy="185" rx="65" ry="55" fill="${animalColor}"/><ellipse cx="290" cy="182" rx="5" ry="7" fill="#282b31"/><ellipse cx="338" cy="182" rx="5" ry="7" fill="#282b31"/><ellipse cx="314" cy="213" rx="20" ry="15" fill="#f5eee2"/><circle cx="314" cy="207" r="6" fill="#d87980"/>`
+      : subject === "bear"
+        ? `<circle cx="270" cy="145" r="28" fill="${animalColor}"/><circle cx="358" cy="145" r="28" fill="${animalColor}"/><circle cx="270" cy="145" r="12" fill="#dfb7a0"/><circle cx="358" cy="145" r="12" fill="#dfb7a0"/><circle cx="314" cy="184" r="68" fill="${animalColor}"/><ellipse cx="314" cy="210" rx="30" ry="23" fill="#e8cdb5"/><circle cx="314" cy="199" r="9" fill="#302c2b"/><circle cx="290" cy="177" r="5" fill="#282b31"/><circle cx="338" cy="177" r="5" fill="#282b31"/>`
+        : subject === "bird" || subject === "owl"
+          ? `<ellipse cx="314" cy="190" rx="70" ry="86" fill="${animalColor}"/><path d="M250 183 211 215l42 19M378 183l39 32-42 19" fill="${animalColor}"/><circle cx="290" cy="174" r="20" fill="#f4eee0"/><circle cx="338" cy="174" r="20" fill="#f4eee0"/><circle cx="290" cy="175" r="8" fill="#282b31"/><circle cx="338" cy="175" r="8" fill="#282b31"/><path d="m314 188-13 22h26Z" fill="#e5a944"/>`
+          : subject === "deer"
+            ? `<path d="M284 151 267 97l22 28 10-42 8 51M345 151l20-54-23 28-8-42-9 51" fill="none" stroke="#8a6547" stroke-width="9" stroke-linecap="round" stroke-linejoin="round"/><ellipse cx="314" cy="185" rx="62" ry="59" fill="${animalColor}"/><ellipse cx="314" cy="214" rx="25" ry="17" fill="#f2e7d8"/><circle cx="290" cy="180" r="5" fill="#282b31"/><circle cx="338" cy="180" r="5" fill="#282b31"/><circle cx="314" cy="211" r="7" fill="#302c2b"/>`
+            : `<path d="M261 164 258 115l38 30 39 0 39-30-5 49Z" fill="${animalColor}"/><ellipse cx="314" cy="185" rx="66" ry="58" fill="${animalColor}"/><ellipse cx="314" cy="211" rx="29" ry="20" fill="#f0e5d7"/><circle cx="290" cy="182" r="6" fill="#282b31"/><circle cx="338" cy="182" r="6" fill="#282b31"/><ellipse cx="314" cy="211" rx="8" ry="6" fill="#302c2b"/>`;
+  const hat = hasHat
+    ? `<path d="M261 138q6-57 53-61 47 4 53 61Z" fill="${hatColor}"/><path d="M249 136q65-18 130 0v12q-65 13-130 0Z" fill="${hatColor}"/><path d="M279 105q35-16 70 0" fill="none" stroke="#ffffff55" stroke-width="4"/>`
+    : "";
+  const tail = subject === "fox"
+    ? `<path d="M203 279q-86 10-76-59 8-54 74-19-43 0-30 38 11 25 43 14Z" fill="${animalColor}"/><path d="M128 231q15-24 47-20-24 21-7 43-34-1-40-23" fill="#f4eee2"/>`
+    : subject ? `<path d="M219 292q-63 7-72-38 39 12 61-19" fill="none" stroke="${animalColor}" stroke-width="22" stroke-linecap="round"/>` : "";
+  const personBody = isBoy
+    ? `<path d="M299 205h30l8 24 40 20-12 28-33-15v54h-36v-54l-33 15-12-28 40-20Z" fill="${shirtColor}" stroke="#fff" stroke-opacity=".3" stroke-width="3"/><path d="m296 310-5 65h24l10-53 10 53h24l-5-65Z" fill="#45556a"/><path d="m287 375-7 9h37l-2-9m20 0-2 9h37l-7-9" fill="#343941"/><path d="m264 247-29 39m141-39 29 39" stroke="${skinTone}" stroke-width="12" stroke-linecap="round"/>`
+    : isGirl
+      ? `<path d="M301 204h26l7 25 48 35-15 22-36-20-17 68h-40l-17-68-36 20-15-22 48-35 7-25Z" fill="${dressColor}" stroke="#fff" stroke-opacity=".3" stroke-width="3"/><path d="m274 334 40-9 40 9-9 43h-62Z" fill="${dressColor}"/><path d="m283 377-7 7h34l4-7m16 0 4 7h34l-7-7" fill="#343941"/><path d="m265 246-28 43m138-43 28 43" stroke="${skinTone}" stroke-width="12" stroke-linecap="round"/>`
+      : `<path d="M300 205h28l8 25 42 31-14 23-38-20-12 54h-40l-12-54-38 20-14-23 42-31 8-25Z" fill="${shirtColor}" stroke="#fff" stroke-opacity=".3" stroke-width="3"/><path d="m280 318 68 0-8 59h-52Z" fill="#45556a"/><path d="m288 377-7 7h34l2-7m15 0 2 7h34l-7-7" fill="#343941"/><path d="m265 246-28 43m138-43 28 43" stroke="${skinTone}" stroke-width="12" stroke-linecap="round"/>`;
+  const genericBody = `<ellipse cx="314" cy="276" rx="85" ry="77" fill="#d7a648"/><circle cx="314" cy="177" r="59" fill="#e4bd8e"/><circle cx="294" cy="173" r="5" fill="#302b2a"/><circle cx="334" cy="173" r="5" fill="#302b2a"/><path d="M298 195q16 12 32 0" fill="none" stroke="#984f51" stroke-width="4" stroke-linecap="round"/>`;
+  const scenery = `${night && /\b(moon|stars)\b/i.test(prompt) ? `<circle cx="500" cy="81" r="34" fill="#f4eac3"/>` : ""}${/\b(stars)\b/i.test(prompt) ? `<g fill="#fff5cf">${[[86,74],[174,111],[425,96],[552,147],[475,218],[108,194],[365,66]].map(([x,y]) => `<circle cx="${x}" cy="${y}" r="3"/>`).join("")}</g>` : ""}${/\b(sun|sunny)\b/i.test(prompt) ? `<circle cx="496" cy="91" r="40" fill="#ffe59a"/>` : ""}${/\bclouds?\b/i.test(prompt) ? `<g fill="#fff7db" opacity=".8"><ellipse cx="119" cy="112" rx="50" ry="17"/><ellipse cx="146" cy="106" rx="29" ry="19"/><ellipse cx="433" cy="137" rx="44" ry="13"/></g>` : ""}`;
+  const title = prompt.slice(0, 100);
+  const subjectBody = isPerson
+    ? `${personBody}${face}${hasHat ? hat : ""}`
+    : subject
+      ? `${tail}<ellipse cx="317" cy="332" rx="103" ry="19" fill="#1e302d" opacity=".3"/><ellipse cx="314" cy="274" rx="77" ry="61" fill="${animalColor}"/><path d="M264 293v42h22v-40m54 0v40h23v-49" fill="${animalColor}"/><path d="M271 332h18m48 0h19" stroke="#f0e5d7" stroke-width="8" stroke-linecap="round"/>${face}${hat}`
+      : `${face}${/\b(?:hat|cap)\b/i.test(prompt) ? hat : ""}`;
+  const showGround = isVillage || subject || isPerson || /\b(flower|flowers|rose|tulip|castle|house|home|cottage|building|car|truck|bus|vehicle|tree|forest|woods|mountain|mountains|landscape|ocean|sea|beach|waterfall)\b/i.test(prompt);
+  const backdrop = showGround
+    ? `<path d="M0 292q122-92 244 0t238-7q94-76 158-24v179H0Z" fill="${night ? "#45556a" : "#a5b484"}"/><path d="M0 335q112-88 247-13t231-8q89-69 162-28v154H0Z" fill="url(#${sceneId}-ground)"/>`
+    : "";
+  return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 440" role="img" aria-labelledby="${sceneId}-title"><title id="${sceneId}-title">${escapeHtml(title)}</title><defs><linearGradient id="${sceneId}-sky" x2="0" y2="1"><stop stop-color="${skyTop}"/><stop offset="1" stop-color="${skyBottom}"/></linearGradient><linearGradient id="${sceneId}-ground" x2="0" y2="1"><stop stop-color="${ground}"/><stop offset="1" stop-color="#455c4f"/></linearGradient><filter id="${sceneId}-shadow" x="-30%" y="-30%" width="160%" height="180%"><feDropShadow dx="0" dy="10" stdDeviation="8" flood-color="#172522" flood-opacity=".22"/></filter></defs><rect width="640" height="440" rx="28" fill="url(#${sceneId}-sky)"/>${scenery}${backdrop}<g filter="url(#${sceneId}-shadow)">${subjectBody}</g></svg>`;
+}
+
+async function createIllustration(conversation, prompt) {
+  if (/\b(?:violent|violence|kill|murder|blood|gore|attack|assault|bombing|explosion|stabbing|shooting|warfare|battlefield|torture|beating|fight|wound|wounded|corpse|massacre)\b/i.test(prompt)) {
+    conversation.messages.push({
+      role: "assistant",
+      text: "I can’t create illustrations depicting violence. Try a peaceful, non-violent description instead."
+    });
+    conversation.updatedAt = Date.now();
+    renderConversation();
+    saveConversations();
+    return;
+  }
+  sendingMessage = true;
+  const sendButton = document.querySelector("#send-chat");
+  sendButton.disabled = true;
+  document.querySelectorAll(".chat-status").forEach(status => status.remove());
+  saveConversations();
+  showChatStatus("ROBO is creating your image…");
+  try {
+    const response = await fetch("/api/image", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ prompt })
+    });
+    const result = await response.json();
+    if (response.status === 503 && result.configured === false) {
+      const imageSvg = vectorIllustration(prompt);
+      conversation.messages.push({
+        role: "assistant",
+        text: "Gemini image generation isn’t configured on this server yet, so this is a local vector preview. Add GEMINI_API_KEY to the server environment to create prompt-specific Gemini images.",
+        imagePrompt: prompt,
+        imageSvg
+      });
+    } else if (response.status === 429) {
+      conversation.messages.push({
+        role: "assistant",
+        text: "Gemini temporarily rejected this request because its image quota or rate limit was reached. I can’t bypass Google’s limit, but here’s a local vector preview while you check your project’s AI Studio rate limits.",
+        imagePrompt: prompt,
+        imageSvg: vectorIllustration(prompt)
+      });
+    } else {
+      if (!response.ok) throw new Error(result.error || `Gemini image generation returned HTTP ${response.status}.`);
+      if (typeof result.data !== "string" || !["image/png", "image/jpeg", "image/webp"].includes(result.mimeType)) {
+        throw new Error("Gemini returned an invalid image. Please try again.");
+      }
+      conversation.messages.push({
+        role: "assistant",
+        text: "Here’s your image, generated by Gemini from your description.",
+        imagePrompt: prompt,
+        imageData: result.data,
+        imageMimeType: result.mimeType
+      });
+    }
+    conversation.updatedAt = Date.now();
+    document.querySelectorAll(".chat-status").forEach(status => status.remove());
+    renderConversation();
+    saveConversations();
+  } catch (error) {
+    console.error("ROBO could not generate the image.", error);
+    document.querySelectorAll(".chat-status").forEach(status => status.remove());
+    showChatStatus(error.message || "ROBO couldn't generate that image. Please try again.", true, () => createIllustration(conversation, prompt));
+  } finally {
+    sendingMessage = false;
+    sendButton.disabled = false;
+  }
+}
+
+function showChatStatus(message, retry = false, retryAction = () => requestAnswer(currentConversation())) {
   const container = document.querySelector("#conversation-messages");
   const status = document.createElement("div");
   status.className = `chat-status${retry ? " chat-error" : ""}`;
@@ -276,7 +494,7 @@ function showChatStatus(message, retry = false) {
     const button = document.createElement("button");
     button.type = "button";
     button.textContent = "Retry";
-    button.addEventListener("click", () => requestAnswer(currentConversation()));
+    button.addEventListener("click", retryAction);
     status.append(button);
   }
   container.append(status);
@@ -300,8 +518,8 @@ async function requestAnswer(conversation) {
       })
     });
     const result = await response.json();
-    if (!response.ok) throw new Error(result.error || `Public search returned HTTP ${response.status}.`);
-    if (typeof result.text !== "string" || !result.text.trim()) throw new Error("ROBO found no readable search results. Please try again.");
+    if (!response.ok) throw new Error(result.error || `ROBO returned HTTP ${response.status}.`);
+    if (typeof result.text !== "string" || !result.text.trim()) throw new Error("ROBO returned an empty answer. Please try again.");
     const lastQuestion = [...conversation.messages].reverse().find(message => message.role === "user");
     const exploration = lastQuestion ? findExploration(lastQuestion.text) : null;
     conversation.messages.push({
@@ -317,7 +535,7 @@ async function requestAnswer(conversation) {
   } catch (error) {
     console.error("ROBO could not answer the message.", error);
     document.querySelectorAll(".chat-status").forEach(status => status.remove());
-    showChatStatus(error.message || "ROBO couldn't reach its public search sources. Please try again.", true);
+    showChatStatus(error.message || "ROBO couldn't answer that question. Please try again.", true);
   } finally {
     sendingMessage = false;
     sendButton.disabled = false;
@@ -335,6 +553,22 @@ async function sendMessage(text) {
   conversation.messages.push({ role: "user", text: value });
   conversation.updatedAt = Date.now();
   document.querySelector("#workspace-chat-input").value = "";
+  const imagePrompt = getImagePrompt(value);
+  if (imagePrompt) {
+    createIllustration(conversation, imagePrompt);
+    return;
+  }
+  if (/\b(?:create|make|generate|draw)\b/i.test(value) && /\b(?:image|picture|illustration|drawing|artwork|art)\b/i.test(value) &&
+      /\b(?:as i describe|as i tell you|for me)\b/i.test(value) && !/\b(?:of|with|wearing|showing|depicting|featuring)\b/i.test(value)) {
+    conversation.messages.push({
+      role: "assistant",
+      text: "Yes—describe the subject and details you want in the image, and I’ll create it."
+    });
+    conversation.updatedAt = Date.now();
+    renderConversation();
+    saveConversations();
+    return;
+  }
   if (/^(hi|hello|hey|hiya|good morning|good afternoon|good evening)[!.?,\s]*$/i.test(value)) {
     conversation.messages.push({ role: "assistant", text: "Hello! How can I help you today?" });
     conversation.updatedAt = Date.now();
@@ -427,19 +661,25 @@ function renderTimetable() {
   const heading = [`<div class="timetable-header-cell">Time</div>`].concat(TIMETABLE_DAYS.map(day => `<div class="timetable-header-cell">${day}</div>`)).join("");
   const rows = timetableEntries.map(row => {
     const cells = TIMETABLE_DAYS.map(day => `
-      <input
+      <textarea
         class="timetable-cell"
-        type="text"
-        value="${escapeHtml(row[day] || "")}"
+        rows="1"
         data-time="${row.time}"
         data-day="${day}"
         aria-label="${day} at ${row.time}"
         placeholder="Write a subject"
-      >
+      >${escapeHtml(row[day] || "")}</textarea>
     `).join("");
-    return `<div class="timetable-row"><input class="timetable-time" type="text" value="${escapeHtml(row.time)}" data-time-field="${row.time}" aria-label="Time for row ${row.time}" data-row-time="${row.time}">${cells}</div>`;
+    return `<div class="timetable-row"><textarea class="timetable-time" rows="1" data-time-field="${row.time}" aria-label="Time for row ${row.time}" data-row-time="${row.time}">${escapeHtml(row.time)}</textarea>${cells}</div>`;
   }).join("");
   grid.innerHTML = `<div class="timetable-header">${heading}</div>${rows}`;
+  grid.querySelectorAll(".timetable-cell").forEach(resizeTimetableCell);
+  grid.querySelectorAll(".timetable-time").forEach(resizeTimetableCell);
+}
+
+function resizeTimetableCell(cell) {
+  cell.style.height = "auto";
+  cell.style.height = `${Math.max(60, cell.scrollHeight)}px`;
 }
 
 function hideSplashScreen() {
@@ -525,27 +765,88 @@ async function signOutUser() {
   showToast("Signed out of ROBO.");
 }
 
-function triggerAlarmTone() {
+function getAlarmAudioContext() {
+  const AudioCtor = window.AudioContext || window.webkitAudioContext;
+  if (!AudioCtor) return null;
+  if (!alarmAudioContext) alarmAudioContext = new AudioCtor();
+  return alarmAudioContext;
+}
+
+function stopAlarmTone() {
+  if (alarmSoundTimeout) {
+    window.clearTimeout(alarmSoundTimeout);
+    alarmSoundTimeout = null;
+  }
+  activeAlarmOscillators.forEach(oscillator => {
+    try { oscillator.stop(); } catch (error) { /* Oscillator may already have stopped. */ }
+  });
+  activeAlarmOscillators = [];
+}
+
+function triggerAlarmTone(soundId = settings.alarmSound) {
   try {
-    const AudioCtor = window.AudioContext || window.webkitAudioContext;
-    if (!AudioCtor) return;
-    const audio = new AudioCtor();
-    const oscillator = audio.createOscillator();
-    const gainNode = audio.createGain();
-    oscillator.type = "sine";
-    oscillator.frequency.setValueAtTime(440, audio.currentTime);
-    oscillator.frequency.exponentialRampToValueAtTime(660, audio.currentTime + 1.1);
-    gainNode.gain.setValueAtTime(0.0001, audio.currentTime);
-    gainNode.gain.exponentialRampToValueAtTime(0.05, audio.currentTime + 0.15);
-    gainNode.gain.exponentialRampToValueAtTime(0.0001, audio.currentTime + 1.6);
-    oscillator.connect(gainNode);
-    gainNode.connect(audio.destination);
-    oscillator.start();
-    oscillator.stop(audio.currentTime + 1.7);
-    oscillator.onended = () => audio.close();
+    const audio = getAlarmAudioContext();
+    if (!audio) {
+      showToast("Alarm sounds are not supported by this browser.");
+      return;
+    }
+    stopAlarmTone();
+    const sound = ALARM_SOUNDS.find(option => option.id === soundId) || ALARM_SOUNDS[0];
+    const beginPlayback = () => {
+      const startAt = audio.currentTime + 0.03;
+      const duration = 5;
+      const interval = 0.36;
+      for (let offset = 0, index = 0; offset < duration; offset += interval, index += 1) {
+        const noteDuration = Math.min(0.25, duration - offset);
+        const oscillator = audio.createOscillator();
+        const gain = audio.createGain();
+        const noteStart = startAt + offset;
+        const noteEnd = noteStart + noteDuration;
+        oscillator.type = sound.wave;
+        oscillator.frequency.setValueAtTime(sound.notes[index % sound.notes.length], noteStart);
+        gain.gain.setValueAtTime(0.0001, noteStart);
+        gain.gain.exponentialRampToValueAtTime(0.045, noteStart + Math.min(0.035, noteDuration / 3));
+        gain.gain.setValueAtTime(0.045, noteEnd - Math.min(0.05, noteDuration / 3));
+        gain.gain.exponentialRampToValueAtTime(0.0001, noteEnd);
+        oscillator.connect(gain);
+        gain.connect(audio.destination);
+        oscillator.start(noteStart);
+        oscillator.stop(noteEnd);
+        activeAlarmOscillators.push(oscillator);
+      }
+      alarmSoundTimeout = window.setTimeout(stopAlarmTone, duration * 1000);
+    };
+    const resumed = audio.state === "suspended" ? audio.resume() : Promise.resolve();
+    resumed.then(beginPlayback).catch(error => {
+      console.warn("Unable to play ROBO alarm tone.", error);
+      showToast("The alarm sound could not be played. Check your browser audio settings.");
+    });
   } catch (error) {
     console.warn("Unable to play ROBO alarm tone.", error);
+    showToast("The alarm sound could not be played. Check your browser audio settings.");
   }
+}
+
+function renderAlarmSoundOptions() {
+  const container = document.querySelector("#alarm-sound-options");
+  if (!container) return;
+  container.innerHTML = ALARM_SOUNDS.map((sound, index) => `
+    <button type="button" class="alarm-sound-option" data-alarm-sound="${sound.id}" aria-pressed="${settings.alarmSound === sound.id}">
+      <span class="alarm-sound-number">${String(index + 1).padStart(2, "0")}</span>
+      <span>${sound.name}</span>
+      <span class="alarm-sound-preview" aria-hidden="true">▶</span>
+    </button>
+  `).join("");
+}
+
+function selectAlarmSound(soundId) {
+  const sound = ALARM_SOUNDS.find(option => option.id === soundId);
+  if (!sound) return;
+  settings.alarmSound = sound.id;
+  saveStored(SETTINGS_STORAGE_KEY, settings);
+  renderAlarmSoundOptions();
+  document.querySelector("#alarm-sound-status").textContent = `Selected ${sound.name}. Playing five-second preview.`;
+  triggerAlarmTone(sound.id);
 }
 
 function renderAlarmList() {
@@ -568,6 +869,12 @@ function renderAlarmList() {
 
 function addAlarm(whenValue, labelValue) {
   if (!whenValue) return;
+  try {
+    const audio = getAlarmAudioContext();
+    if (audio?.state === "suspended") audio.resume().catch(error => console.warn("Unable to prepare ROBO alarm audio.", error));
+  } catch (error) {
+    console.warn("Unable to prepare ROBO alarm audio.", error);
+  }
   const safeLabel = labelValue.trim() || "Morning review";
   const nextAlarm = {
     id: `alarm-${Date.now()}`,
@@ -641,9 +948,38 @@ function updateTimerDisplay() {
   const timerDisplay = document.querySelector("#timer-display");
   if (!timerDisplay) return;
   const totalSeconds = Math.max(0, Math.ceil(timerRemainingMs / 1000));
-  const minutes = Math.floor(totalSeconds / 60);
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
   const seconds = totalSeconds % 60;
-  timerDisplay.textContent = `${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`;
+  timerDisplay.textContent = `${String(hours).padStart(2, "0")}:${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`;
+}
+
+function readTimerInputSeconds() {
+  const hoursInput = document.querySelector("#timer-hours");
+  const minutesInput = document.querySelector("#timer-minutes");
+  const secondsInput = document.querySelector("#timer-seconds");
+  const hours = Math.max(0, Math.min(5, Number(hoursInput.value) || 0));
+  const minutes = Math.max(0, Math.min(59, Number(minutesInput.value) || 0));
+  const seconds = Math.max(0, Math.min(59, Number(secondsInput.value) || 0));
+  const totalSeconds = hours * 3600 + minutes * 60 + seconds;
+  if (totalSeconds > MAX_TIMER_SECONDS) {
+    hoursInput.value = "5";
+    minutesInput.value = "0";
+    secondsInput.value = "0";
+    document.querySelector("#timer-limit-note").textContent = "Maximum timer duration is 5 hours.";
+    return MAX_TIMER_SECONDS;
+  }
+  hoursInput.value = String(hours);
+  minutesInput.value = String(minutes);
+  secondsInput.value = String(seconds);
+  document.querySelector("#timer-limit-note").textContent = "Set up to 5 hours.";
+  return totalSeconds;
+}
+
+function updateTimerFromInputs() {
+  if (timerRunning) return;
+  timerRemainingMs = readTimerInputSeconds() * 1000;
+  updateTimerDisplay();
 }
 
 function stopTimerLoop() {
@@ -655,12 +991,14 @@ function stopTimerLoop() {
 }
 
 function startTimer() {
-  const input = document.querySelector("#timer-input");
-  if (!input) return;
-  if (!timerRemainingMs && Number(input.value) > 0) {
-    timerRemainingMs = Number(input.value) * 60 * 1000;
-  }
+  if (!timerRemainingMs) timerRemainingMs = readTimerInputSeconds() * 1000;
   if (timerRemainingMs <= 0 || timerRunning) return;
+  try {
+    const audio = getAlarmAudioContext();
+    if (audio?.state === "suspended") audio.resume().catch(error => console.warn("Unable to prepare ROBO alarm audio.", error));
+  } catch (error) {
+    console.warn("Unable to prepare ROBO alarm audio.", error);
+  }
   timerRunning = true;
   timerHandle = window.setInterval(() => {
     timerRemainingMs = Math.max(0, timerRemainingMs - 1000);
@@ -679,8 +1017,7 @@ function pauseTimer() {
 
 function resetTimer() {
   stopTimerLoop();
-  const input = document.querySelector("#timer-input");
-  timerRemainingMs = Number(input.value || 0) * 60 * 1000;
+  timerRemainingMs = readTimerInputSeconds() * 1000;
   updateTimerDisplay();
 }
 
@@ -860,6 +1197,10 @@ document.querySelector("#history-search").addEventListener("input", renderHistor
 document.querySelectorAll(".nav-item").forEach(button => button.addEventListener("click", () => setView(button.dataset.view)));
 document.querySelector("#theme-toggle").addEventListener("click", toggleTheme);
 document.querySelector("#settings-theme").addEventListener("click", toggleTheme);
+document.querySelector("#alarm-sound-options").addEventListener("click", event => {
+  const option = event.target.closest("[data-alarm-sound]");
+  if (option) selectAlarmSound(option.dataset.alarmSound);
+});
 document.querySelector("#clear-history").addEventListener("click", () => {
   if (!conversations.length || !window.confirm("Clear all saved ROBO chats from this browser?")) return;
   conversations = [];
@@ -943,6 +1284,7 @@ document.querySelector("#timetable-grid").addEventListener("input", event => {
   const cell = event.target.closest(".timetable-cell");
   const timeInput = event.target.closest(".timetable-time");
   if (cell) {
+    resizeTimetableCell(cell);
     const row = timetableEntries.find(item => item.time === cell.dataset.time);
     if (!row) return;
     row[cell.dataset.day] = cell.value;
@@ -950,6 +1292,7 @@ document.querySelector("#timetable-grid").addEventListener("input", event => {
     return;
   }
   if (timeInput) {
+    resizeTimetableCell(timeInput);
     const row = timetableEntries.find(item => item.time === timeInput.dataset.rowTime);
     if (!row) return;
     const newTime = normalizeTimeString(timeInput.value || "");
@@ -1000,6 +1343,9 @@ document.querySelector("#reset-stopwatch").addEventListener("click", resetStopwa
 document.querySelector("#start-timer").addEventListener("click", startTimer);
 document.querySelector("#pause-timer").addEventListener("click", pauseTimer);
 document.querySelector("#reset-timer").addEventListener("click", resetTimer);
+document.querySelectorAll("#timer-hours, #timer-minutes, #timer-seconds").forEach(input => {
+  input.addEventListener("input", updateTimerFromInputs);
+});
 
 document.querySelector("#add-schedule").addEventListener("click", () => {
   const formShell = document.querySelector("#schedule-form-shell");
@@ -1226,6 +1572,7 @@ renderHistory();
 renderStudents();
 renderSchedule();
 renderAlarmList();
+renderAlarmSoundOptions();
 updateStopwatchDisplay();
 resetTimer();
 updateClock();

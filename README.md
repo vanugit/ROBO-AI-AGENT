@@ -2,17 +2,40 @@
 
 A responsive ROBO chat workspace with local chat history, chat search, student profiles, explanation-style preferences, light/dark themes, and an immersive-exploration gallery inside the **Students** section. The gallery has exactly 20 curated topics and these six filters, in order: **All**, **How Things Work**, **Space**, **Human Body**, **Nature**, and **History**. The Freshwater Swamp Ecosystem is featured; each topic card opens its own illustrated scene with four guided learning stops and interactive hotspots.
 
+The supplied `robo-icon.ico` is used for the app icon, splash screen, and ROBO identity marks. Light and dark themes update the interface palette and text contrast across the workspace, forms, and dialogs.
+
 ## Run locally
 
-ROBO does not use Gemini, a paid AI model, or any secret API key. Start it from the repository directory:
+ROBO answers general questions with Gemini, computes basic arithmetic locally, and searches Google News only when current news are requested. General AI and Gemini image generation use the server-side `GEMINI_API_KEY`; without it, ROBO can still calculate basic arithmetic and show requested public news, but it does not substitute unrelated search results for answers. Keep the key server-side—never add it to frontend code. Start the app from the repository directory:
 
 ```powershell
 python server.py
 ```
 
-Then visit `http://127.0.0.1:8765/`. For each question, ROBO searches Wikipedia's public article endpoints and Google News' public RSS search, then shows source links and available excerpts. These are public, no-key web endpoints—not a local, offline, all-world knowledge database. They require internet access and can be temporarily unavailable or rate-limited.
+Then visit `http://127.0.0.1:8765/`. Set `GEMINI_API_KEY` on the server for general AI responses, including code generation. You can optionally set `GEMINI_TEXT_MODEL` to choose a Gemini text model; the default is `gemini-2.5-flash`. The key stays on the server and is never sent to the browser. Google API quota and pricing limits apply.
 
-This is a source-search tool, not a generative AI model or a complete index of the world's knowledge. It cannot guarantee answers for every question or synthesize arbitrary information like Gemini or ChatGPT; it finds and presents relevant public-source material, and it reports when search sources are unavailable. A greeting such as “hi” gets a direct friendly reply. Chat history, student profiles, and preferences are stored in the browser. There is no build step or external Python package dependency.
+Current-news requests use Google News' public RSS search and show source links; that endpoint requires internet access and can be temporarily unavailable or rate-limited. Other questions—including science, math word problems, and programming—are sent to Gemini when configured; if unavailable or not configured, ROBO reports that directly and does not fall back to news or encyclopedia search. Basic arithmetic is evaluated locally without `eval`. Gemini can make mistakes, so verify important factual, mathematical, and programming output. Chat history, student profiles, and preferences are stored in the browser. There is no build step or external Python package dependency.
+
+### Gemini API key
+
+Create a Gemini API key in [Google AI Studio](https://aistudio.google.com/apikey) and add it as the server environment variable `GEMINI_API_KEY` (Railway: Service → Variables). This is separate from the Google OAuth client ID and secret used for sign-in. For local PowerShell testing:
+
+```powershell
+$env:GEMINI_API_KEY = "your-key-from-ai-studio"
+python server.py
+```
+
+ROBO uses the key for general chat and image generation. The general chat uses Google's Gemini `generateContent` API. Requests from every user of a deployment that shares this key use that Google project's quota and may incur charges if its applicable free quota or access is exceeded. Check Google's [current API pricing and free-tier eligibility](https://ai.google.dev/gemini-api/docs/pricing) before configuring a key.
+
+### Gemini image generation
+
+ROBO calls Google's `gemini-nano-banana-2.1` image-generation API from the Python server, so the key is not exposed to browsers. Requests from every user of a deployment that shares this key use that Google project’s quota and may incur charges if its applicable free quota or access is exceeded. The free Gemini consumer app does not mean API image generation is unlimited or always free; check Google's [current API pricing and free-tier eligibility](https://ai.google.dev/gemini-api/docs/pricing) before configuring a key. The server limits prompts to 2,000 characters, applies a basic violence-related keyword block, and caps image requests at five per IP per minute. Google’s own API safety filters also apply. Generated images are kept in the user's browser chat history and can be downloaded.
+
+Without a configured Gemini key, prompts fall back to local, template-guided SVG illustrations. These are free and original, but cannot faithfully depict arbitrary descriptions; they are not a generative image model. Local images can be downloaded as SVG files. The violence keyword block is not a comprehensive safety classifier.
+
+The **ROBO Generations** section in the left navigation links to [Craiyon](https://www.craiyon.com/en) as an external service. Craiyon could not be verified to provide a supported public API, so the launch button navigates to its website; ROBO does not send prompts to Craiyon or import its generated media.
+
+The Scheduled clock has ten locally synthesized alarm sounds. Select a sound under **Settings → Alarm sound** to save it and hear a five-second preview; alarms and timer completion use the selected sound. The timer accepts hours, minutes, and seconds up to a five-hour maximum.
 
 ## Real sign-in setup
 
@@ -36,4 +59,4 @@ ROBO_SESSION_SECRET=<a long random secret>
 
 Only configure the providers you intend to offer. Use the same exact root redirect URL in the provider console and `ROBO_PUBLIC_URL`; for local development, the default is `http://127.0.0.1:8765/`. Never put client secrets in frontend files. Without provider credentials, the buttons remain disabled rather than pretending to sign a user in. Continuing as a guest remains available.
 
-Railway can use the included `Procfile` (`python server.py`). The server reads Railway's `PORT` environment variable and binds to `0.0.0.0`; no model API key or package installation is required.
+Railway can use the included `Procfile` (`python server.py`). The server reads Railway's `PORT` environment variable and binds to `0.0.0.0`; no package installation is required.

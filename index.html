@@ -6,21 +6,22 @@
     <meta name="theme-color" content="#f5f7f4">
     <meta name="description" content="Explore the world with ROBO through interactive, topic-based 3D learning experiences.">
     <title>ROBO — Your AI learning companion</title>
+    <link rel="icon" href="robo-icon.ico">
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=Manrope:wght@500;600;700;800&display=swap" rel="stylesheet">
-    <link rel="stylesheet" href="styles.css">
+    <link rel="stylesheet" href="styles.css?v=robo-icon-dark-theme">
   </head>
   <body>
     <div id="robo-splash-screen" class="robo-splash-screen" aria-live="polite" aria-label="ROBO welcome screen">
-      <div class="robo-splash-mark" aria-hidden="true">R</div>
+      <div class="robo-splash-mark" aria-hidden="true"><img class="robo-icon" src="robo-icon.ico" alt=""></div>
       <div class="robo-splash-text">ROBO</div>
     </div>
 
     <div class="app-shell">
       <aside class="sidebar" id="sidebar" aria-label="Main navigation">
         <a class="brand sidebar-brand" href="#" aria-label="ROBO home">
-          <span class="brand-mark" aria-hidden="true">R</span>
+          <span class="brand-mark" aria-hidden="true"><img class="robo-icon" src="robo-icon.ico" alt=""></span>
           <span>ROBO</span>
         </a>
         <button class="new-chat-button" id="new-chat" type="button"><span aria-hidden="true">＋</span> New chat</button>
@@ -28,6 +29,7 @@
         <nav class="side-nav" aria-label="Workspace">
           <button type="button" class="nav-item active" data-view="chat"><span aria-hidden="true">◌</span> Chat</button>
           <button type="button" class="nav-item" data-view="students"><span aria-hidden="true">♙</span> Students</button>
+          <button type="button" class="nav-item" data-view="image-generator"><span aria-hidden="true">▧</span> ROBO Generations</button>
           <button type="button" class="nav-item" data-view="scheduled"><span aria-hidden="true">◫</span> Scheduled</button>
           <button type="button" class="nav-item" data-view="customize"><span aria-hidden="true">✳</span> Customize</button>
           <button type="button" class="nav-item" data-view="settings"><span aria-hidden="true">⚙</span> Settings</button>
@@ -70,7 +72,7 @@
               </div>
             </div>
             <div class="chat-welcome">
-              <span class="robo-avatar welcome-avatar" aria-hidden="true">R</span>
+              <span class="robo-avatar welcome-avatar" aria-hidden="true"><img class="robo-icon" src="robo-icon.ico" alt=""></span>
               <p class="eyebrow">SEARCH THE OPEN WEB</p>
               <h1 id="chat-heading">Hello! How can I help you today?</h1>
               <p class="chat-intro">Ask a question to search Wikipedia and current news. ROBO will show you the source links.</p>
@@ -84,8 +86,8 @@
             <div class="chat-composer-wrap">
               <form class="workspace-composer" id="workspace-chat-form">
                 <label class="sr-only" for="workspace-chat-input">Message ROBO</label>
-                <textarea id="workspace-chat-input" rows="1" placeholder="Message ROBO..." autocomplete="off"></textarea>
-                <div class="composer-actions"><span>Public-source search, not an all-knowing AI. Check sources for important facts.</span><button type="submit" aria-label="Search public sources" id="send-chat">↑</button></div>
+                <textarea id="workspace-chat-input" rows="1" placeholder="Ask ROBO a question..." autocomplete="off"></textarea>
+                <div class="composer-actions"><button type="submit" aria-label="Send message" id="send-chat">↑</button></div>
               </form>
             </div>
           </div>
@@ -198,9 +200,13 @@
 
                   <div class="clock-section" id="clock-timer-panel" role="tabpanel" hidden>
                     <div class="timer-box">
-                      <label for="timer-input">Minutes</label>
-                      <input id="timer-input" type="number" min="1" max="180" value="15" step="1">
-                      <div class="timer-display" id="timer-display">15:00</div>
+                      <div class="timer-inputs" aria-label="Timer duration, maximum five hours">
+                        <label><span>Hour</span><input id="timer-hours" type="number" min="0" max="5" value="0" step="1" inputmode="numeric"></label>
+                        <label><span>Minute</span><input id="timer-minutes" type="number" min="0" max="59" value="15" step="1" inputmode="numeric"></label>
+                        <label><span>Second</span><input id="timer-seconds" type="number" min="0" max="59" value="0" step="1" inputmode="numeric"></label>
+                      </div>
+                      <p id="timer-limit-note" class="timer-limit-note">Set up to 5 hours.</p>
+                      <div class="timer-display" id="timer-display">00:15:00</div>
                       <div class="stopwatch-actions">
                         <button type="button" id="start-timer" class="setting-action primary-action">Start</button>
                         <button type="button" id="pause-timer" class="setting-action">Pause</button>
@@ -274,6 +280,18 @@
             </div>
           </div>
         </section>
+        <section class="utility-view app-view" id="image-generator-view" hidden>
+          <div class="utility-card image-generator-panel">
+            <p class="eyebrow">CREATIVE STUDIO</p>
+            <h1>ROBO Generations</h1>
+            <p class="utility-description">Create or edit images and videos with Craiyon. Selecting the button opens Craiyon.</p>
+            <a class="image-generator-launch" href="https://www.craiyon.com/en">
+              <span aria-hidden="true">✦</span>
+              <span>Edit and create your images and videos here</span>
+              <span class="image-generator-arrow" aria-hidden="true">↗</span>
+            </a>
+          </div>
+        </section>
         <section class="utility-view app-view" id="customize-view" hidden>
           <div class="utility-card"><p class="eyebrow">MAKE ROBO YOURS</p><h1>Customize</h1><p class="utility-description">Choose how ROBO explains things. Your preference is saved on this device.</p>
             <fieldset class="preference-group"><legend>Explanation style</legend><label><input type="radio" name="response-style" value="simple"> Simple and concise</label><label><input type="radio" name="response-style" value="balanced"> Balanced (recommended)</label><label><input type="radio" name="response-style" value="detailed"> Detailed and curious</label></fieldset>
@@ -284,6 +302,12 @@
             <div class="setting-row"><span><strong>Appearance</strong><small>Switch between light and dark themes.</small></span><button class="setting-action" id="settings-theme" type="button">Dark theme</button></div>
             <div class="setting-row"><span><strong>Chat history</strong><small>Conversations are stored in this browser on this device.</small></span><button class="setting-action danger-action" id="clear-history" type="button">Clear history</button></div>
             <div class="setting-row"><span><strong>Google sign-in</strong><small>Account authentication is not configured in this demo.</small></span><button class="setting-action" id="settings-signin" type="button">Sign-in details</button></div>
+            <section class="alarm-sound-settings" aria-labelledby="alarm-sound-heading">
+              <h2 id="alarm-sound-heading">Alarm sound</h2>
+              <p class="utility-description">Choose a sound. Each option plays a five-second preview.</p>
+              <div id="alarm-sound-options" class="alarm-sound-options"></div>
+              <p id="alarm-sound-status" class="alarm-sound-status" role="status" aria-live="polite"></p>
+            </section>
           </div>
         </section>
       </main>
@@ -292,7 +316,7 @@
     <dialog class="explore-dialog" id="explore-dialog" aria-labelledby="scene-title">
       <div class="dialog-shell">
         <header class="dialog-header">
-          <a class="brand compact" href="#" aria-label="ROBO"><span class="brand-mark" aria-hidden="true">R</span><span>ROBO</span></a>
+          <a class="brand compact" href="#" aria-label="ROBO"><span class="brand-mark" aria-hidden="true"><img class="robo-icon" src="robo-icon.ico" alt=""></span><span>ROBO</span></a>
           <div class="dialog-topic"><span id="scene-category"></span><span class="breadcrumb-divider">/</span><strong id="scene-title"></strong></div>
           <button class="icon-button close-button" id="close-dialog" type="button" aria-label="Close exploration">×</button>
         </header>
@@ -319,7 +343,7 @@
             <p class="lesson-step" id="lesson-step">01 / 04</p>
             <h2 id="lesson-title"></h2>
             <p class="lesson-copy" id="lesson-copy"></p>
-            <div class="robo-note"><span class="robo-avatar small" aria-hidden="true">R</span><p><strong>ROBO says</strong><span id="robo-note-copy"></span></p></div>
+            <div class="robo-note"><span class="robo-avatar small" aria-hidden="true"><img class="robo-icon" src="robo-icon.ico" alt=""></span><p><strong>ROBO says</strong><span id="robo-note-copy"></span></p></div>
             <div class="lesson-footer"><span><span class="key-icon">⌘</span> Explore at your own pace</span><button id="next-lesson" type="button">Next point <span aria-hidden="true">→</span></button></div>
           </aside>
         </div>
@@ -330,7 +354,7 @@
       <div class="signin-dialog-content">
         <button class="icon-button signin-close" id="close-signin" type="button" aria-label="Close sign-in details">×</button>
         <div class="signin-header">
-          <span class="google-g signin-large" aria-hidden="true">R</span>
+          <span class="robo-avatar signin-large" aria-hidden="true"><img class="robo-icon" src="robo-icon.ico" alt=""></span>
           <h2 id="signin-title">Sign in to ROBO</h2>
         </div>
         <p>Sign in securely with your provider. Your password is entered only on that provider’s website.</p>
@@ -347,6 +371,6 @@
     </dialog>
 
     <script src="explorations.js"></script>
-    <script src="app.js"></script>
+    <script src="app.js?v=robo-icon-dark-theme"></script>
   </body>
 </html>

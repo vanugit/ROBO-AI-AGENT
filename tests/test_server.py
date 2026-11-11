@@ -1,9 +1,11 @@
+import base64
+import io
 import json
 import threading
 import unittest
 import xml.etree.ElementTree as ET
 from http.server import ThreadingHTTPServer
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
@@ -110,13 +112,109 @@ class ServerEndpointTests(unittest.TestCase):
         except HTTPError as error:
             return error
 
-    def test_health_reports_no_api_key_requirement(self):
-        response = urlopen(self.base_url + "/api/health", timeout=3)
-        health = json.loads(response.read())
+    def post_image(self, payload):
+        request = Request(
+            self.base_url + "/api/image",
+            data=json.dumps(payload).encode(),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            return urlopen(request, timeout=3)
+        except HTTPError as error:
+            return error
+
+    def test_health_reports_general_answer_configuration_without_exposing_key(self):
+        with patch.dict("os.environ", {"GEMINI_API_KEY": ""}):
+            response = urlopen(self.base_url + "/api/health", timeout=3)
+            health = json.loads(response.read())
 
         self.assertTrue(health["ok"])
-        self.assertEqual(health["mode"], "public-source-search")
-        self.assertFalse(health["apiKeyRequired"])
+        self.assertEqual(health["mode"], "gemini-chat-public-news-search")
+        self.assertFalse(health["generalAnswersConfigured"])
+
+    def test_image_config_does_not_expose_api_key(self):
+        with patch.dict("os.environ", {"GEMINI_API_KEY": "server-only-secret"}):
+            response = urlopen(self.base_url + "/api/image/config", timeout=3)
+            body = response.read().decode()
+
+        self.assertEqual(json.loads(body), {"configured": True})
+        self.assertNotIn("server-only-secret", body)
+
+    def test_image_generation_uses_gemini_and_returns_image_data(self):
+        generated = {"data": base64.b64encode(b"image-bytes").decode(), "mimeType": "image/png"}
+        with patch.dict("os.environ", {"GEMINI_API_KEY": "server-only-secret"}), patch(
+            "server.generate_gemini_image", return_value=generated
+        ) as generate:
+            response = self.post_image({"prompt": "A village with two huts"})
+
+        self.assertEqual(response.code, 200)
+        self.assertEqual(json.loads(response.read()), generated)
+        generate.assert_called_once_with("A village with two huts")
+
+    def test_image_generation_uses_local_fallback_when_api_key_is_missing(self):
+        with patch.dict("os.environ", {}, clear=True):
+            response = self.post_image({"prompt": "A red fox"})
+
+        self.assertEqual(response.code, 503)
+        result = json.loads(response.read())
+        self.assertFalse(result["configured"])
+
+    def test_image_generation_reports_quota_limit_without_leaking_provider_details(self):
+        quota_error = HTTPError(
+            "https://generativelanguage.googleapis.com", 429, "Rate limited", {}, None
+        )
+        with patch.dict("os.environ", {"GEMINI_API_KEY": "server-only-secret"}), patch(
+            "server.generate_gemini_image", side_effect=quota_error
+        ):
+            response = self.post_image({"prompt": "A red fox with a red hat"})
+
+        self.assertEqual(response.code, 429)
+        result = json.loads(response.read())
+        self.assertIn("quota", result["error"].lower())
+        self.assertNotIn("server-only-secret", json.dumps(result))
+
+    def test_image_generation_rejects_violent_prompts_before_calling_provider(self):
+        with patch.dict("os.environ", {"GEMINI_API_KEY": "server-only-secret"}), patch(
+            "server.generate_gemini_image"
+        ) as generate:
+            response = self.post_image({"prompt": "A graphic bloody fight"})
+
+        self.assertEqual(response.code, 400)
+        self.assertIn("violence", json.loads(response.read())["error"])
+        generate.assert_not_called()
+
+    def test_gemini_request_keeps_key_in_header_and_validates_image_response(self):
+        response_body = json.dumps({
+            "output_image": {
+                "data": base64.b64encode(b"image-bytes").decode(),
+                "mime_type": "image/webp",
+            }
+        }).encode()
+
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self):
+                return response_body
+
+        fake_response = FakeResponse()
+        with patch.dict("os.environ", {"GEMINI_API_KEY": "server-only-secret"}), patch(
+            "server.urlopen", return_value=fake_response
+        ) as open_url:
+            result = server.generate_gemini_image("A red fox in a garden")
+
+        request = open_url.call_args.args[0]
+        self.assertEqual(request.full_url, "https://generativelanguage.googleapis.com/v1beta/interactions")
+        self.assertEqual(request.get_header("X-goog-api-key"), "server-only-secret")
+        self.assertEqual(request.get_header("Api-revision"), "2026-05-20")
+        self.assertEqual(json.loads(request.data)["model"], "gemini-nano-banana-2.1")
+        self.assertEqual(result["mimeType"], "image/webp")
+        self.assertEqual(base64.b64decode(result["data"]), b"image-bytes")
 
     def test_auth_config_disables_unconfigured_providers(self):
         response = urlopen(self.base_url + "/api/auth/config", timeout=3)
@@ -165,18 +263,115 @@ class ServerEndpointTests(unittest.TestCase):
 
         self.assertEqual(session, {"signedIn": False})
 
-    def test_chat_endpoint_searches_latest_user_question_without_api_key(self):
-        result = {"text": "Found this.", "sources": []}
-        with patch("server.search_sources", return_value=result) as search:
-            response = self.post_chat({"messages": [
-                {"role": "user", "text": "Hello"},
-                {"role": "assistant", "text": "Hi there."},
-                {"role": "user", "text": "What is in today's news?"},
-            ]})
+    def test_chat_endpoint_calculates_arithmetic_without_search_or_api_key(self):
+        with patch.dict("os.environ", {"GEMINI_API_KEY": ""}), \
+                patch("server.search_news") as news, \
+                patch("server.search_wikipedia") as wikipedia:
+            response = self.post_chat({"messages": [{"role": "user", "text": "12 + 34"}]})
 
         self.assertEqual(response.code, 200)
-        self.assertEqual(json.loads(response.read()), result)
-        search.assert_called_once_with("What is in today's news?")
+        self.assertEqual(json.loads(response.read()), {"text": "46", "sources": []})
+        news.assert_not_called()
+        wikipedia.assert_not_called()
+
+    def test_chat_endpoint_searches_news_only_for_current_news_requests(self):
+        news_result = [{
+            "title": "Science update",
+            "text": "A current report.",
+            "url": "https://news.example/article",
+            "publisher": "Example News",
+            "publishedAt": "today",
+        }]
+        with patch.dict("os.environ", {"GEMINI_API_KEY": ""}), \
+                patch("server.search_news", return_value=news_result) as news, \
+                patch("server.search_wikipedia") as wikipedia:
+            response = self.post_chat({"messages": [
+                {"role": "user", "text": "What are today's latest science news headlines?"}
+            ]})
+
+        result = json.loads(response.read())
+        self.assertEqual(response.code, 200)
+        self.assertIn("Science update", result["text"])
+        self.assertEqual(result["sources"][0]["url"], news_result[0]["url"])
+        news.assert_called_once()
+        wikipedia.assert_not_called()
+
+    def test_chat_endpoint_uses_gemini_for_general_questions_and_code(self):
+        with patch.dict("os.environ", {"GEMINI_API_KEY": "server-only-secret"}), \
+                patch("server.generate_gemini_answer", return_value="Here is the Python code.") as generate, \
+                patch("server.search_news") as news, \
+                patch("server.search_wikipedia") as wikipedia:
+            response = self.post_chat({
+                "messages": [
+                    {"role": "user", "text": "Write Python code that adds two numbers."},
+                    {"role": "assistant", "text": "Sure."},
+                    {"role": "user", "text": "Include input validation."},
+                ],
+                "responseStyle": "detailed",
+            })
+
+        self.assertEqual(response.code, 200)
+        self.assertEqual(json.loads(response.read()), {"text": "Here is the Python code.", "sources": []})
+        passed_messages, response_style = generate.call_args.args
+        self.assertEqual(passed_messages[-1]["text"], "Include input validation.")
+        self.assertEqual(response_style, "detailed")
+        news.assert_not_called()
+        wikipedia.assert_not_called()
+
+    def test_gemini_answer_uses_server_key_and_preserves_chat_context(self):
+        response = MagicMock()
+        response.__enter__.return_value = response
+        response.read.return_value = json.dumps({
+            "candidates": [{"content": {"parts": [{"text": "Here is the code."}]}}]
+        }).encode()
+        messages = [
+            {"role": "user", "text": "Make a calculator."},
+            {"role": "assistant", "text": "Which language?"},
+            {"role": "user", "text": "Python."},
+        ]
+        with patch.dict("os.environ", {"GEMINI_API_KEY": "server-only-secret"}), \
+                patch("server.urlopen", return_value=response) as open_url:
+            answer = server.generate_gemini_answer(messages, "detailed")
+
+        request = open_url.call_args.args[0]
+        request_body = json.loads(request.data)
+        self.assertEqual(answer, "Here is the code.")
+        self.assertEqual(request.get_header("X-goog-api-key"), "server-only-secret")
+        self.assertEqual(request_body["contents"][0]["role"], "user")
+        self.assertIn("Python.", request_body["contents"][-1]["parts"][0]["text"])
+        self.assertIn("working code", request_body["system_instruction"]["parts"][0]["text"])
+
+    def test_chat_endpoint_explains_when_general_ai_is_not_configured(self):
+        with patch.dict("os.environ", {"GEMINI_API_KEY": ""}), \
+                patch("server.search_news") as news, \
+                patch("server.search_wikipedia") as wikipedia:
+            response = self.post_chat({
+                "messages": [{
+                    "role": "user",
+                    "text": "Explain why the sky appears blue.",
+                }]
+            })
+
+        self.assertEqual(response.code, 502)
+        self.assertIn("general AI is not configured", json.loads(response.read())["error"])
+        news.assert_not_called()
+        wikipedia.assert_not_called()
+
+    def test_programming_request_without_ai_does_not_fall_back_to_search(self):
+        with patch.dict("os.environ", {"GEMINI_API_KEY": ""}), \
+                patch("server.search_news") as news, \
+                patch("server.search_wikipedia") as wikipedia:
+            response = self.post_chat({
+                "messages": [{
+                    "role": "user",
+                    "text": "give me the code in python to print my name vaishnavi",
+                }]
+            })
+
+        self.assertEqual(response.code, 502)
+        self.assertIn("general AI is not configured", json.loads(response.read())["error"])
+        news.assert_not_called()
+        wikipedia.assert_not_called()
 
     def test_chat_endpoint_validates_messages(self):
         response = self.post_chat({"messages": [{"role": "system", "text": "bad role"}]})
