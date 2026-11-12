@@ -6,7 +6,7 @@ The supplied `robo-icon.ico` is used for the app icon, splash screen, and ROBO i
 
 ## Run locally
 
-ROBO answers general questions with Gemini, computes basic arithmetic locally, and searches Google News only when current news are requested. General AI and Gemini image generation use the server-side `GEMINI_API_KEY`; without it, ROBO can still calculate basic arithmetic and show requested public news, but it does not substitute unrelated search results for answers. Keep the key server-side—never add it to frontend code. Start the app from the repository directory:
+ROBO answers general questions with Gemini when available, computes basic arithmetic locally, and searches Google News for current-news requests. If Gemini is unavailable or rejects its configuration, general questions fall back to relevant Wikipedia summaries and current-news questions return the live news headlines with source links. Gemini chat and image generation use the server-side `GEMINI_API_KEY`; keep the key server-side—never add it to frontend code. Start the app from the repository directory:
 
 ```powershell
 python server.py
@@ -14,7 +14,7 @@ python server.py
 
 Then visit `http://127.0.0.1:8765/`. Set `GEMINI_API_KEY` on the server for general AI responses, including code generation. You can optionally set `GEMINI_TEXT_MODEL` to choose a Gemini text model; the default is `gemini-2.5-flash`. The key stays on the server and is never sent to the browser. Google API quota and pricing limits apply.
 
-Current-news requests use Google News' public RSS search and show source links; that endpoint requires internet access and can be temporarily unavailable or rate-limited. Other questions—including science, math word problems, and programming—are sent to Gemini when configured; if unavailable or not configured, ROBO reports that directly and does not fall back to news or encyclopedia search. Basic arithmetic is evaluated locally without `eval`. Gemini can make mistakes, so verify important factual, mathematical, and programming output. Chat history, student profiles, and preferences are stored in the browser. There is no build step or external Python package dependency.
+Current-news requests use Google News' public RSS search and show source links; India-focused queries use the Indian edition. That endpoint requires internet access and can be temporarily unavailable or rate-limited. Other questions—including science, math word problems, and programming—are sent to Gemini when configured; if Gemini is unavailable, ROBO searches Wikipedia for a relevant reference and links its sources. If no article matches, it returns a direct Wikipedia search link. Basic arithmetic is evaluated locally without `eval`. Gemini can make mistakes, so verify important factual, mathematical, and programming output. Chat history, student profiles, and preferences are stored in the browser. There is no build step or external Python package dependency.
 
 ### Gemini API key
 
@@ -57,6 +57,6 @@ ROBO_PUBLIC_URL=https://your-deployed-domain/
 ROBO_SESSION_SECRET=<a long random secret>
 ```
 
-Only configure the providers you intend to offer. Use the same exact root redirect URL in the provider console and `ROBO_PUBLIC_URL`; for local development, the default is `http://127.0.0.1:8765/`. Never put client secrets in frontend files. Without provider credentials, the buttons remain disabled rather than pretending to sign a user in. Continuing as a guest remains available.
+Only configure the providers you intend to offer. Use the same exact root redirect URL in the provider console and `ROBO_PUBLIC_URL`; for Railway, use the currently provisioned public domain, not an old generated `*.up.railway.app` domain. If `ROBO_PUBLIC_URL` points to a different generated Railway domain, ROBO uses the active request domain instead. Add that active origin and exact root redirect URI to the provider console, then redeploy. For local development, the default is `http://127.0.0.1:8765/`. Never put client secrets in frontend files. Without provider credentials, the buttons remain disabled rather than pretending to sign a user in. Continuing as a guest remains available.
 
 Railway can use the included `Procfile` (`python server.py`). The server reads Railway's `PORT` environment variable and binds to `0.0.0.0`; no package installation is required.

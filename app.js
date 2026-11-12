@@ -14,6 +14,14 @@ let animationPaused = false;
 let sceneRotation = { x: 7, y: -8 };
 let sceneDrag = null;
 let sendingMessage = false;
+const CHAT_GREETINGS = [
+  "Hey there! What are we learning today?",
+  "Hi! What would you like to explore?",
+  "Hello! What are you curious about?",
+  "Welcome back! What can I help you discover?",
+  "Hey! What shall we figure out together?"
+];
+let chatGreetingIndex = -1;
 const CHAT_STORAGE_KEY = "robo-chat-history-v1";
 const SETTINGS_STORAGE_KEY = "robo-settings-v1";
 const STUDENTS_STORAGE_KEY = "robo-students-v1";
@@ -191,8 +199,11 @@ function setView(name) {
 
 function createChat() {
   currentChatId = null;
-  document.querySelector("#conversation-messages").replaceChildren();
+  chatGreetingIndex = (chatGreetingIndex + 1) % CHAT_GREETINGS.length;
+  document.querySelector("#chat-heading").textContent = CHAT_GREETINGS[chatGreetingIndex];
   document.querySelector("#workspace-chat-input").value = "";
+  renderConversation();
+  renderHistory();
   setView("chat");
 }
 

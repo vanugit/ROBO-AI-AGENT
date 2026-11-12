@@ -15,7 +15,7 @@ from datetime import datetime, timezone
 from html.parser import HTMLParser
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from urllib.error import HTTPError, URLError
-from urllib.parse import quote, urlencode
+from urllib.parse import quote, urlencode, urlsplit
 from urllib.request import Request, urlopen
 
 
@@ -141,16 +141,29 @@ def allow_image_request(client_address):
 
 def public_origin(handler):
     configured_url = os.environ.get("ROBO_PUBLIC_URL", "").strip()
+    forwarded_proto = handler.headers.get("X-Forwarded-Proto", "").split(",")[0].strip()
+    scheme = forwarded_proto if forwarded_proto in ("http", "https") else "http"
+    request_host = handler.headers.get("X-Forwarded-Host", handler.headers.get("Host", "localhost"))
+    request_host = request_host.split(",")[0].strip()
+    request_hostname = (urlsplit("//" + request_host).hostname or "").lower()
     if configured_url:
-        from urllib.parse import urlsplit
         parsed = urlsplit(configured_url)
         if parsed.scheme not in ("http", "https") or not parsed.netloc:
             raise ValueError("ROBO_PUBLIC_URL must be an absolute http(s) URL.")
+        configured_hostname = (parsed.hostname or "").lower()
+        railway_domain = r"[a-z0-9][a-z0-9-]*\.up\.railway\.app"
+        if (
+            re.fullmatch(railway_domain, configured_hostname)
+            and re.fullmatch(railway_domain, request_hostname)
+            and configured_hostname != request_hostname
+        ):
+            print(
+                f"ROBO_PUBLIC_URL points to a different Railway domain; using the active request host {request_hostname}.",
+                flush=True,
+            )
+            return f"{scheme}://{request_hostname}"
         return f"{parsed.scheme}://{parsed.netloc}"
-    forwarded_proto = handler.headers.get("X-Forwarded-Proto", "").split(",")[0].strip()
-    scheme = forwarded_proto if forwarded_proto in ("http", "https") else "http"
-    host = handler.headers.get("Host", "localhost")
-    return f"{scheme}://{host}"
+    return f"{scheme}://{request_host}"
 
 
 def oauth_provider_config(provider):
@@ -269,11 +282,14 @@ def search_wikipedia(query, limit=3):
 
 
 def search_news(query, limit=5):
+    india_search = bool(re.search(r"\b(?:india|new delhi|delhi)\b", query, re.IGNORECASE))
+    language = "en-IN" if india_search else "en-US"
+    country = "IN" if india_search else "US"
     url = "https://news.google.com/rss/search?" + urlencode({
         "q": query,
-        "hl": "en-US",
-        "gl": "US",
-        "ceid": "US:en",
+        "hl": language,
+        "gl": country,
+        "ceid": f"{country}:en",
     })
     root = fetch_xml(url)
     items = []
@@ -400,11 +416,61 @@ def calculate_arithmetic(query):
 
 def is_current_news_request(query):
     query = query.lower()
-    if re.search(r"\b(?:latest|today|current|breaking|recent|updates?|happening now)\b", query) and re.search(
+    if re.search(r"\b(?:latest|today|current|breaking|recent|updates?|happening now|daily|tonight|this morning)\b", query) and re.search(
         r"\b(?:news|headlines|current events)\b", query
     ):
         return True
     return bool(re.search(r"\b(?:give me|show me|tell me)\s+(?:the\s+)?(?:news|headlines)\b", query))
+
+
+def news_search_query(query):
+    terms = re.sub(
+        r"\b(?:what|are|is|the|latest|daily|today|current|breaking|recent|updates?|headlines|"
+        r"news|happening|now|give|me|show|tell|please|in|for)\b",
+        " ",
+        query,
+        flags=re.IGNORECASE,
+    )
+    terms = re.sub(r"[^a-zA-Z0-9\s'-]", " ", terms)
+    terms = re.sub(r"\s+", " ", terms).strip()
+    return f"{terms or 'latest'} news today"[:300]
+
+
+def answer_from_news(news_items, heading="Here are the latest news results I found:"):
+    if not news_items:
+        return {"text": "I couldn't find current news results for that search.", "sources": []}
+    lines = [heading]
+    lines.extend(
+        f"- {item['title']} ({item.get('publisher', 'Source')})"
+        + (f": {item['text']}" if item.get("text") else "")
+        for item in news_items
+    )
+    sources = [
+        {key: item[key] for key in ("title", "url", "publisher", "publishedAt") if item.get(key)}
+        for item in news_items
+    ]
+    return {"text": "\n\n".join(lines), "sources": sources}
+
+
+def answer_from_wikipedia(query):
+    articles = search_wikipedia(query, limit=3)
+    if not articles:
+        search_url = "https://en.wikipedia.org/w/index.php?" + urlencode({"search": query})
+        return {
+            "text": "I couldn't find a reliable encyclopedia match for that exact question. Try a few different keywords.",
+            "sources": [{"title": "Search Wikipedia", "url": search_url, "publisher": "Wikipedia"}],
+        }
+
+    article = articles[0]
+    text = f"Here's an overview of {article['title']}:\n\n{article['text']}"
+    related = [item["title"] for item in articles[1:] if item.get("title")]
+    if related:
+        text += "\n\nRelated topics: " + ", ".join(related)
+    sources = [
+        {key: item[key] for key in ("title", "url", "publisher") if item.get(key)}
+        for item in articles
+    ]
+    return {"text": text, "sources": sources}
 
 
 def generate_gemini_answer(messages, response_style="balanced", news_items=None):
@@ -590,37 +656,39 @@ class RoboHandler(SimpleHTTPRequestHandler):
             news_request = is_current_news_request(query)
             api_configured = bool(os.environ.get("GEMINI_API_KEY", "").strip())
             if news_request:
-                news = search_news(query[:300])
+                news = search_news(news_search_query(query))
                 if api_configured:
-                    answer = generate_gemini_answer(validated, payload.get("responseStyle"), news)
-                    sources = [
-                        {key: item[key] for key in ("title", "url", "publisher", "publishedAt") if item.get(key)}
-                        for item in news
-                    ]
-                    self.send_json(200, {"text": answer, "sources": sources})
-                else:
-                    lines = ["Here are the latest news results I found:"]
-                    lines.extend(
-                        f"- {item['title']} ({item.get('publisher', 'Source')})"
-                        + (f": {item['text']}" if item.get("text") else "")
-                        for item in news
-                    )
-                    self.send_json(200, {
-                        "text": "\n\n".join(lines) if news else "I couldn't find current news results for that search.",
-                        "sources": [
+                    try:
+                        answer = generate_gemini_answer(validated, payload.get("responseStyle"), news)
+                    except RuntimeError as error:
+                        print(f"Gemini news summary failed; returning live headlines: {error}", flush=True)
+                        self.send_json(200, answer_from_news(
+                            news,
+                            "ROBO's AI summary is unavailable, so here are the latest news results I found:",
+                        ))
+                    else:
+                        sources = [
                             {key: item[key] for key in ("title", "url", "publisher", "publishedAt") if item.get(key)}
                             for item in news
-                        ],
-                    })
+                        ]
+                        self.send_json(200, {"text": answer, "sources": sources})
+                else:
+                    self.send_json(200, answer_from_news(news))
                 return
 
             if api_configured:
-                self.send_json(200, {"text": generate_gemini_answer(validated, payload.get("responseStyle")), "sources": []})
+                try:
+                    answer = generate_gemini_answer(validated, payload.get("responseStyle"))
+                except RuntimeError as error:
+                    print(f"Gemini answer failed; using Wikipedia fallback: {error}", flush=True)
+                    result = answer_from_wikipedia(query)
+                    result["text"] = "ROBO's AI is temporarily unavailable, so here's a reference-based answer instead.\n\n" + result["text"]
+                    self.send_json(200, result)
+                else:
+                    self.send_json(200, {"text": answer, "sources": []})
                 return
 
-            raise RuntimeError(
-                "ROBO's general AI is not configured on this server. Set GEMINI_API_KEY on the server to answer questions beyond basic arithmetic and news search."
-            )
+            self.send_json(200, answer_from_wikipedia(query))
         except (ValueError, UnicodeDecodeError):
             self.send_json(400, {"error": "The request body must be valid JSON."})
         except RuntimeError as error:
