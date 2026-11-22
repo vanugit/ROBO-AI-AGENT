@@ -672,26 +672,43 @@ class ServerEndpointTests(unittest.TestCase):
         self.assertEqual(result["sources"], [])
         search.assert_called_once_with("What are you?", include_news=False)
 
-    def test_chat_endpoint_uses_clean_story_search_and_returns_only_relevant_source(self):
-        articles = [
-            {"title": "Cinderella", "text": "Cinderella is a traditional fairy tale.", "url": "https://example.com/cinderella", "publisher": "Example"},
-            {"title": "Unrelated article", "text": "This has no matching topic.", "url": "https://example.com/unrelated", "publisher": "Example"},
-        ]
-        with patch.dict("os.environ", {"GEMINI_API_KEY": ""}), patch(
-            "server.search_wikipedia", return_value=articles
-        ) as wikipedia, patch("server.search_news") as news:
+    def test_chat_endpoint_generates_story_without_requiring_search_results(self):
+        query = "Can you tell me the story of The monkey and the cap seller?"
+        with patch.dict("os.environ", {"GEMINI_API_KEY": "configured-key"}), \
+                patch("server.generate_gemini_answer", return_value="A complete story.") as generate, \
+                patch("server.search_sources") as search:
+            response = self.post_chat({"messages": [{"role": "user", "text": query}]})
+
+        self.assertEqual(response.code, 200)
+        self.assertEqual(json.loads(response.read()), {"text": "A complete story.", "sources": []})
+        self.assertEqual(generate.call_args.args[0][-1]["text"], query)
+        search.assert_not_called()
+
+    def test_chat_endpoint_falls_back_to_known_story_when_gemini_fails(self):
+        with patch.dict("os.environ", {"GEMINI_API_KEY": "configured-key"}), \
+                patch("server.generate_gemini_answer", side_effect=RuntimeError("provider unavailable")), \
+                patch("server.search_sources") as search:
             response = self.post_chat({
-                "messages": [{"role": "user", "text": "Can you write the story of cindrella?"}]
+                "messages": [{"role": "user", "text": "Tell me the story of the monkey and the cap seller"}]
             })
 
         result = json.loads(response.read())
         self.assertEqual(response.code, 200)
-        self.assertIn("Cinderella is a traditional fairy tale.", result["text"])
-        self.assertIn("original story writing requires Gemini", result["text"])
-        self.assertNotIn("Unrelated article", result["text"])
-        self.assertEqual(result["sources"][0]["title"], "Cinderella")
-        wikipedia.assert_called_once_with("cindrella")
-        news.assert_not_called()
+        self.assertIn("cap seller", result["text"])
+        self.assertIn("monkeys", result["text"])
+        self.assertEqual(result["sources"], [])
+        search.assert_not_called()
+
+    def test_chat_endpoint_reports_story_provider_error_instead_of_empty_search(self):
+        with patch.dict("os.environ", {"GEMINI_API_KEY": ""}), \
+                patch("server.search_sources") as search:
+            response = self.post_chat({
+                "messages": [{"role": "user", "text": "Tell me a story about a dragon"}]
+            })
+
+        self.assertEqual(response.code, 503)
+        self.assertIn("story-generation service is unavailable", json.loads(response.read())["error"])
+        search.assert_not_called()
 
     def test_chat_endpoint_refuses_sensitive_content_without_search(self):
         with patch.dict("os.environ", {"GEMINI_API_KEY": ""}), \
@@ -703,10 +720,15 @@ class ServerEndpointTests(unittest.TestCase):
         search.assert_not_called()
 
     def test_chat_endpoint_searches_benign_alcohol_health_question(self):
-        search_result = {
+        source = {
+            "title": "Health guidance",
             "text": "Alcohol use can harm health.",
-            "sources": [{"title": "Health guidance", "url": "https://example.com/health"}],
-            "items": [],
+            "url": "https://example.com/health",
+            "publisher": "Example",
+        }
+        search_result = {
+            "sources": [{key: value for key, value in source.items() if key != "text"}],
+            "items": [source],
         }
         with patch.dict("os.environ", {"GEMINI_API_KEY": ""}), patch(
             "server.search_sources", return_value=search_result
@@ -716,6 +738,9 @@ class ServerEndpointTests(unittest.TestCase):
             })
 
         self.assertEqual(response.code, 200)
+        result = json.loads(response.read())
+        self.assertIn("Alcohol use can harm health.", result["text"])
+        self.assertEqual(result["sources"][0]["url"], source["url"])
         search.assert_called_once_with("Is alcohol harmful?", include_news=False)
 
     def test_chat_endpoint_summarizes_uploaded_file_contents_without_gemini(self):
@@ -875,13 +900,7 @@ class ServerEndpointTests(unittest.TestCase):
         self.assertTrue(generate.call_args.kwargs["return_sources"])
         search.assert_not_called()
 
-    def test_chat_endpoint_uses_public_search_if_google_grounding_has_no_citations(self):
-        source = {
-            "title": "Diwali",
-            "text": "Diwali is a festival of lights celebrated in India.",
-            "url": "https://example.com/diwali",
-            "publisher": "Example",
-        }
+    def test_chat_endpoint_keeps_gemini_answer_without_grounding_citations(self):
         with patch.dict("os.environ", {
             "GEMINI_API_KEY": "server-only-secret",
             "GOOGLE_SEARCH_API_KEY": "",
@@ -889,18 +908,37 @@ class ServerEndpointTests(unittest.TestCase):
         }), patch("server.generate_gemini_answer", return_value={
             "text": "An unverified generated answer.",
             "sources": [],
-        }), patch("server.search_sources", return_value={
-            "items": [source],
-            "sources": [source],
-        }) as search:
+        }), patch("server.search_sources") as search:
             response = self.post_chat({"messages": [{"role": "user", "text": "What is Diwali?"}]})
 
         result = json.loads(response.read())
         self.assertEqual(response.code, 200)
-        self.assertNotIn("unverified generated answer", result["text"])
-        self.assertIn("Diwali is a festival of lights", result["text"])
-        self.assertEqual(result["sources"][0]["url"], source["url"])
-        search.assert_called_once_with("What is Diwali?", include_news=False)
+        self.assertIn("An unverified generated answer.", result["text"])
+        self.assertIn("couldn't verify this answer with linked web sources", result["text"])
+        self.assertEqual(result["sources"], [])
+        search.assert_not_called()
+
+    def test_chat_endpoint_uses_gemini_when_configured_search_fails(self):
+        with patch.dict("os.environ", {
+            "GEMINI_API_KEY": "server-only-secret",
+            "GOOGLE_SEARCH_API_KEY": "search-key",
+            "GOOGLE_SEARCH_ENGINE_ID": "search-engine",
+        }), patch("server.search_sources", side_effect=RuntimeError("search provider unavailable")) as search, \
+                patch("server.generate_gemini_answer", return_value={
+                    "text": "Here is an answer from the configured AI.",
+                    "sources": [],
+                }) as generate:
+            response = self.post_chat({"messages": [{
+                "role": "user",
+                "text": "Explain why leaves change color.",
+            }]})
+
+        result = json.loads(response.read())
+        self.assertEqual(response.code, 200)
+        self.assertIn("Here is an answer from the configured AI.", result["text"])
+        self.assertTrue(generate.call_args.kwargs["search_unavailable"])
+        self.assertIsNone(generate.call_args.args[2])
+        search.assert_called_once_with("Explain why leaves change color.", include_news=False)
 
     def test_hello_world_python_is_searched_then_generated_without_gemini(self):
         source = {
@@ -1054,6 +1092,7 @@ class ServerEndpointTests(unittest.TestCase):
                     },
                 ],
                 response_language="hi",
+                search_unavailable=True,
             )
 
         request = open_url.call_args.args[0]
@@ -1070,6 +1109,7 @@ class ServerEndpointTests(unittest.TestCase):
         self.assertIn("working code in any language", request_body["system_instruction"]["parts"][0]["text"])
         self.assertIn("entirely in Hindi", request_body["system_instruction"]["parts"][0]["text"])
         self.assertIn("untrusted reference data", request_body["system_instruction"]["parts"][0]["text"])
+        self.assertIn("No usable web search results were available", request_body["system_instruction"]["parts"][0]["text"])
 
     def test_gemini_answer_searches_google_and_returns_grounded_sources(self):
         response = MagicMock()
@@ -1230,9 +1270,9 @@ class ServerEndpointTests(unittest.TestCase):
             })
 
         result = json.loads(response.read())
-        self.assertEqual(response.code, 200)
-        self.assertIn("couldn't find matching results", result["text"])
-        self.assertEqual(result["sources"], [])
+        self.assertEqual(response.code, 503)
+        self.assertIn("Gemini is not configured", result["error"])
+        self.assertIn("public search found no matching sources", result["error"])
         news.assert_not_called()
 
     def test_chat_endpoint_validates_messages(self):
