@@ -16,6 +16,12 @@ let sceneDrag = null;
 let sendingMessage = false;
 let preparingMessage = false;
 let selectedFiles = [];
+let learnerTutor = null;
+let learnerFiles = [];
+let learnerBusy = false;
+let learnerSpeechSequence = 0;
+let learnerMouthTimers = [];
+let learnerMouthFallbackTimer = null;
 const MAX_CHAT_FILES = 15;
 const MAX_CHAT_FILE_BYTES = 1024 * 1024;
 const MAX_CHAT_FILES_BYTES = 5 * 1024 * 1024;
@@ -70,12 +76,12 @@ const UI_TRANSLATION_BATCH_CHARS = 22000;
 const UI_TRANSLATION_EXCLUDED = [
   "script", "style", "noscript", "code", "pre", "textarea", "input", "svg",
   ".conversation-messages", ".selected-files", ".robo-toast", ".robo-splash-screen",
-  ".student-list", "#timetable-grid", "#schedule-list", "#alarm-list",
+  ".student-list", ".learner-transcript-list", "#timetable-grid", "#schedule-list", "#alarm-list",
   "[data-user-content='true']", "[contenteditable='true']"
 ].join(",");
 const UI_TRANSLATION_ATTRIBUTE_EXCLUDED = [
   "script", "style", "noscript", "svg", ".conversation-messages", ".selected-files",
-  ".robo-toast", ".robo-splash-screen", ".student-list", "#timetable-grid",
+  ".robo-toast", ".robo-splash-screen", ".student-list", ".learner-transcript-list", "#timetable-grid",
   "#schedule-list", "#alarm-list", "[data-user-content='true']", "[contenteditable='true']"
 ].join(",");
 const EXPLICIT_SEXUAL_REQUEST = /\b(?:porn(?:ography)?|xxx|nsfw|hentai|lewd|incest|bestiality|erotic(?:a)?|sexualit(?:y|ies)|sexually explicit|sexual content|sexual (?:act|story|fantasy)|sex scene|explicit sexual|nude(?:s|ness)?|nudity|naked (?:person|people|woman|man|girl|boy|child|children|teen|teenager|body)|show (?:me )?(?:a )?(?:naked|nude)|topless (?:person|people|woman|man|girl|boy)|bare breasts|striptease|fetish|(?:underage|minor|child(?:ren)?|kid|teen(?:ager)?)\b.{0,40}\b(?:sex|sexual|porn|nude|naked|erotic)|(?:sex|sexual|porn|nude|naked|erotic)\b.{0,40}\b(?:underage|minor|child(?:ren)?|kid|teen(?:ager)?))\b/i;
@@ -145,7 +151,7 @@ let authState = { signedIn: false, provider: "Guest", displayName: "Guest", emai
 let oauthConfig = null;
 let settings = loadStored(SETTINGS_STORAGE_KEY, { theme: "light", responseStyle: "balanced", responseLanguage: "English", alarmSound: "classic" });
 if (!ALARM_SOUNDS.some(sound => sound.id === settings.alarmSound)) settings.alarmSound = "classic";
-settings.responseLanguage = normalizeLanguageName(settings.responseLanguage);
+settings.responseLanguage = "English";
 const originalUiText = new WeakMap();
 const originalUiAttributes = new WeakMap();
 const knownUiTranslations = new Set();
@@ -647,6 +653,8 @@ function setView(name) {
   document.querySelector("#mobile-menu").setAttribute("aria-expanded", "false");
   if (name === "students") renderStudents();
   if (name === "scheduled") renderSchedule();
+  if (name === "learner") openTutorGenderDialog();
+  else stopLearnerSpeech();
   if (name === "chat") document.querySelector("#workspace-chat-input").focus();
 }
 
@@ -1032,9 +1040,9 @@ function renderSelectedFiles() {
   });
 }
 
-async function readSelectedFiles() {
+async function readBrowserFiles(selected) {
   const files = [];
-  for (const file of selectedFiles) {
+  for (const file of selected) {
     const data = await file.arrayBuffer();
     const basename = file.name.split(/[\\/]/).pop().toLowerCase();
     const extension = basename.split(".").pop();
@@ -1063,6 +1071,291 @@ async function readSelectedFiles() {
     }
   }
   return files;
+}
+
+async function readSelectedFiles() {
+  return readBrowserFiles(selectedFiles);
+}
+
+function openTutorGenderDialog() {
+  stopLearnerSpeech();
+  const dialog = document.querySelector("#learner-gender-dialog");
+  if (!dialog.open) dialog.showModal();
+}
+
+function stopLearnerAnimation() {
+  clearLearnerMouthTimers();
+  const stage = document.querySelector(".learner-stage");
+  stage.classList.remove("is-speaking");
+  delete stage.dataset.viseme;
+  document.querySelector("#learner-speaking-status").textContent = learnerTutor
+    ? `${learnerTutor.name} is ready. Type a question below.`
+    : "Select Learner in the navigation to get started.";
+}
+
+function stopLearnerSpeech() {
+  learnerSpeechSequence += 1;
+  if ("speechSynthesis" in window) window.speechSynthesis.cancel();
+  stopLearnerAnimation();
+}
+
+function clearLearnerMouthTimers() {
+  learnerMouthTimers.forEach(timer => window.clearTimeout(timer));
+  learnerMouthTimers = [];
+  window.clearTimeout(learnerMouthFallbackTimer);
+  learnerMouthFallbackTimer = null;
+}
+
+function animateLearnerMouthFallback(text, sequence, index = 0) {
+  if (!text.length || sequence !== learnerSpeechSequence) return;
+  const stage = document.querySelector(".learner-stage");
+  const character = text[index % text.length].toLowerCase();
+  const isPunctuation = /[.,!?;:]/.test(character);
+  const isSpace = /\s/.test(character);
+  const viseme = isSpace || isPunctuation || /[pbm]/.test(character)
+    ? "closed"
+    : /[ou]/.test(character) ? "round" : /a/.test(character) ? "open" : "wide";
+  const duration = isPunctuation ? 160 : isSpace ? 85 : /[aeiouy]/.test(character) ? 82 : 58;
+  stage.dataset.viseme = viseme;
+  learnerMouthFallbackTimer = window.setTimeout(
+    () => animateLearnerMouthFallback(text, sequence, index + 1),
+    duration
+  );
+}
+
+function animateLearnerMouth(word, sequence) {
+  const stage = document.querySelector(".learner-stage");
+  const vowelGroups = word.toLowerCase().match(/[aeiouy]+/g) || [""];
+  const visemes = vowelGroups.map(group =>
+    /[ou]/.test(group) ? "round" : /a/.test(group) ? "open" : "wide"
+  );
+  const duration = Math.max(180, Math.min(420, word.length * 48));
+  const interval = duration / visemes.length;
+  clearLearnerMouthTimers();
+  stage.dataset.viseme = "closed";
+  visemes.forEach((viseme, index) => {
+    learnerMouthTimers.push(window.setTimeout(() => {
+      if (sequence === learnerSpeechSequence) stage.dataset.viseme = viseme;
+    }, index * interval));
+  });
+  learnerMouthTimers.push(window.setTimeout(() => {
+    if (sequence === learnerSpeechSequence) stage.dataset.viseme = "closed";
+  }, duration));
+}
+
+function addLearnerTranscript(speaker, text) {
+  const list = document.querySelector("#learner-transcript-list");
+  const item = document.createElement("li");
+  item.className = "learner-transcript-entry";
+  const label = document.createElement("strong");
+  label.textContent = speaker;
+  const copy = document.createElement("p");
+  copy.textContent = text;
+  item.append(label, copy);
+  list.append(item);
+  document.querySelector("#learner-transcript-empty").hidden = true;
+  list.scrollTop = list.scrollHeight;
+}
+
+function speakLearnerText(text) {
+  if (!("speechSynthesis" in window) || !("SpeechSynthesisUtterance" in window)) {
+    document.querySelector("#learner-speaking-status").textContent =
+      "Voice playback is not available in this browser. You can read the Transcript.";
+    return;
+  }
+  const sequence = ++learnerSpeechSequence;
+  clearLearnerMouthTimers();
+  window.speechSynthesis.cancel();
+  const utterance = new SpeechSynthesisUtterance(text);
+  const languageCode = languageCodeForName(settings.responseLanguage);
+  utterance.lang = languageCode || "en-US";
+  utterance.rate = 0.96;
+  const isFemaleTutor = learnerTutor && learnerTutor.gender === "female";
+  utterance.pitch = learnerTutor && learnerTutor.gender === "male" ? 0.76 : isFemaleTutor ? 1.12 : 1;
+  const voices = window.speechSynthesis.getVoices();
+  const languagePrefix = utterance.lang.toLowerCase().split("-")[0];
+  const genderVoicePattern = isFemaleTutor
+    ? /\b(?:female|woman|zira|jenny|aria|ava|samantha|karen|susan|victoria|tessa|hazel|heera|priya|natasha|serena|allison|joanna|kendra|kimberly|laura|lucia)\b/i
+    : /\b(?:male|man|david|guy|mark|thomas|james|john|daniel|alex|fred|george|ryan|rishi|andrew|brian|christopher|eric|kevin|matthew|oliver|jorge|bruce|ralph|albert|tom|eddy)\b/i;
+  const voice = learnerTutor && learnerTutor.gender !== "neutral"
+    ? voices.find(item => genderVoicePattern.test(item.name) &&
+      item.lang.toLowerCase().startsWith(languagePrefix)) ||
+      voices.find(item => genderVoicePattern.test(item.name))
+    : null;
+  const languageVoice = voices.find(item => item.lang.toLowerCase().startsWith(languagePrefix));
+  if (voice || languageVoice) utterance.voice = voice || languageVoice;
+  const stage = document.querySelector(".learner-stage");
+  utterance.onstart = () => {
+    if (sequence !== learnerSpeechSequence) return;
+    stage.classList.add("is-speaking");
+    stage.dataset.viseme = "closed";
+    animateLearnerMouthFallback(text, sequence);
+    document.querySelector("#learner-speaking-status").textContent = `${learnerTutor.name} is speaking.`;
+  };
+  utterance.onboundary = event => {
+    if (sequence !== learnerSpeechSequence || !Number.isInteger(event.charIndex)) return;
+    if (event.name && event.name !== "word") return;
+    const word = text.slice(event.charIndex).match(/^[^\s.,!?;:()[\]{}]+/);
+    if (word) {
+      clearLearnerMouthTimers();
+      animateLearnerMouth(word[0].replace(/^['"“”]+|['"“”]+$/g, ""), sequence);
+    }
+  };
+  utterance.onend = () => {
+    if (sequence === learnerSpeechSequence) stopLearnerAnimation();
+  };
+  utterance.onerror = event => {
+    if (sequence !== learnerSpeechSequence) return;
+    stopLearnerAnimation();
+    if (!["canceled", "interrupted"].includes(event.error)) {
+      document.querySelector("#learner-speaking-status").textContent =
+        "Voice playback stopped. The transcript is still available.";
+    }
+  };
+  window.speechSynthesis.speak(utterance);
+}
+
+function chooseLearnerTutor(gender) {
+  const tutors = {
+    male: { name: "Kian", gender, image: "assets/male-tutor.png", greeting: "My name is Kian and i am a humanoid robot" },
+    female: { name: "Zia", gender, image: "assets/female-tutor.png", greeting: "My name is Zia and i am an humanoid robot" },
+    neutral: { name: "ROBO", gender, image: "robo-icon.ico", greeting: "I'm ROBO, your AI tutor." }
+  };
+  learnerTutor = tutors[gender];
+  const avatar = document.querySelector("#learner-avatar");
+  avatar.src = learnerTutor.image;
+  avatar.alt = `${learnerTutor.name}, your AI tutor`;
+  const portrait = document.querySelector("#learner-avatar-stage");
+  portrait.dataset.tutorGender = gender;
+  portrait.classList.toggle("has-portrait", gender !== "neutral");
+  document.querySelector("#learner-tutor-name").textContent = learnerTutor.name;
+  document.querySelector("#learner-speaking-status").textContent =
+    `${learnerTutor.name} is ready. Type a question below.`;
+  document.querySelector("#learner-gender-dialog").close();
+  addLearnerTranscript(learnerTutor.name, learnerTutor.greeting);
+  speakLearnerText(learnerTutor.greeting);
+  document.querySelector("#learner-chat-input").focus();
+}
+
+function renderLearnerFiles() {
+  const container = document.querySelector("#learner-selected-files");
+  container.replaceChildren();
+  container.hidden = learnerFiles.length === 0;
+  learnerFiles.forEach((file, index) => {
+    const item = document.createElement("span");
+    item.className = "learner-file-chip";
+    const name = document.createElement("span");
+    name.textContent = file.name;
+    const remove = document.createElement("button");
+    remove.type = "button";
+    remove.textContent = "×";
+    remove.setAttribute("aria-label", `Remove ${file.name}`);
+    remove.disabled = learnerBusy;
+    remove.addEventListener("click", () => {
+      learnerFiles.splice(index, 1);
+      renderLearnerFiles();
+    });
+    item.append(name, remove);
+    container.append(item);
+  });
+}
+
+function speechFriendlyText(text) {
+  return text
+    .replace(/```[\w-]*\s*([\s\S]*?)```/g, "$1")
+    .replace(/\[Sources?\][\s\S]*$/i, "")
+    .replace(/\[([^\]]+)\]\((https?:\/\/[^)]+)\)/g, "$1")
+    .replace(/https?:\/\/\S+/g, "")
+    .replace(/[*_#>`]/g, "")
+    .replace(/\s{2,}/g, " ")
+    .trim();
+}
+
+async function sendLearnerMessage() {
+  if (learnerBusy || !learnerTutor) return;
+  const input = document.querySelector("#learner-chat-input");
+  const value = input.value.trim() || (learnerFiles.length ? "Please summarize the uploaded files." : "");
+  if (!value) {
+    input.focus();
+    return;
+  }
+  if (EXPLICIT_SEXUAL_REQUEST.test(value) || isSensitiveActionRequest(value) ||
+      /\b(?:suicide|self[- ]harm|nudity|nude|naked|porn|sexual content|sexually explicit)\b/i.test(value)) {
+    input.value = "";
+    learnerFiles = [];
+    renderLearnerFiles();
+    const refusal = "Sorry, I can't generate this type of content.";
+    addLearnerTranscript("You", value);
+    addLearnerTranscript(learnerTutor.name, refusal);
+    speakLearnerText(refusal);
+    return;
+  }
+  if (!learnerFiles.length &&
+      /^\s*(?:(?:hi|hello|hey)[,!\s]*)*(?:what(?:'s| is) your name|who are you)\s*[?.!]*\s*$/i.test(value)) {
+    input.value = "";
+    const identity = learnerTutor.gender === "male"
+      ? "My name is Kian and i am a humanoid robot"
+      : learnerTutor.gender === "female"
+        ? "My name is Zia and i am an humanoid robot"
+        : "I'm ROBO, your AI tutor.";
+    addLearnerTranscript("You", value);
+    addLearnerTranscript(learnerTutor.name, identity);
+    speakLearnerText(identity);
+    return;
+  }
+
+  learnerBusy = true;
+  const send = document.querySelector("#learner-send");
+  send.disabled = true;
+  input.disabled = true;
+  document.querySelector("#learner-add-files").disabled = true;
+  renderLearnerFiles();
+  document.querySelector("#learner-speaking-status").textContent = "Preparing your answer…";
+  addLearnerTranscript("You", value);
+  input.value = "";
+  try {
+    const attachments = await readBrowserFiles(learnerFiles);
+    const messages = [
+      {
+        role: "user",
+        text: `Tutor instructions: You are ${learnerTutor.name}, a friendly AI humanoid tutor. Reply in natural, age-appropriate spoken language without Markdown formatting. If the learner asks for a story, create a complete original story on the requested topic, using web results only as helpful background rather than merely repeating them. When files are attached, summarize their actual contents accurately and say clearly if a file cannot be read.`
+      },
+      { role: "assistant", text: "I'm ready to help as your tutor." },
+      { role: "user", text: value }
+    ];
+    const response = await fetch("/api/chat", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        messages,
+        responseStyle: settings.responseStyle,
+        responseLanguage: settings.responseLanguage,
+        attachments
+      })
+    });
+    const result = await response.json();
+    if (!response.ok) throw new Error(result.error || `ROBO returned HTTP ${response.status}.`);
+    if (typeof result.text !== "string" || !result.text.trim()) {
+      throw new Error("ROBO returned an empty answer. Please try again.");
+    }
+    learnerFiles = [];
+    renderLearnerFiles();
+    addLearnerTranscript(learnerTutor.name, result.text.trim());
+    const speech = speechFriendlyText(result.text);
+    if (speech) speakLearnerText(speech);
+    else document.querySelector("#learner-speaking-status").textContent =
+      "The transcript is ready; this answer did not contain text to speak.";
+  } catch (error) {
+    console.error("ROBO could not answer in Learner.", error);
+    document.querySelector("#learner-speaking-status").textContent =
+      error.message || "ROBO couldn't answer that. Please try again.";
+  } finally {
+    learnerBusy = false;
+    send.disabled = false;
+    input.disabled = false;
+    document.querySelector("#learner-add-files").disabled = false;
+    input.focus();
+  }
 }
 
 async function requestAnswer(conversation, attachments = []) {
@@ -1808,6 +2101,59 @@ document.querySelector("#workspace-chat-form").addEventListener("submit", event 
   event.preventDefault();
   sendMessage(document.querySelector("#workspace-chat-input").value);
 });
+document.querySelector("#learner-gender-dialog").addEventListener("click", event => {
+  const button = event.target.closest("[data-tutor-gender]");
+  if (button) chooseLearnerTutor(button.dataset.tutorGender);
+});
+document.querySelector("#learner-change-tutor").addEventListener("click", openTutorGenderDialog);
+document.querySelector("#learner-transcript-toggle").addEventListener("click", event => {
+  const panel = document.querySelector("#learner-transcript");
+  panel.hidden = !panel.hidden;
+  document.querySelector(".learner-main").classList.toggle("has-transcript", !panel.hidden);
+  event.currentTarget.setAttribute("aria-expanded", String(!panel.hidden));
+  event.currentTarget.textContent = panel.hidden ? "Transcript" : "Hide transcript";
+  event.currentTarget.setAttribute("aria-label", panel.hidden ? "Show transcript" : "Hide transcript");
+  if (!panel.hidden) document.querySelector("#learner-transcript-list").scrollTop =
+    document.querySelector("#learner-transcript-list").scrollHeight;
+});
+document.querySelector("#learner-add-files").addEventListener("click", () => {
+  document.querySelector("#learner-file-input").click();
+});
+document.querySelector("#learner-file-input").addEventListener("change", event => {
+  const input = event.currentTarget;
+  const incoming = Array.from(input.files || []);
+  input.value = "";
+  const existing = new Set(learnerFiles.map(file => `${file.name}:${file.size}:${file.lastModified}`));
+  const additions = incoming.filter(file => !existing.has(`${file.name}:${file.size}:${file.lastModified}`));
+  if (learnerFiles.length + additions.length > MAX_CHAT_FILES) {
+    showToast(`You can attach up to ${MAX_CHAT_FILES} files.`);
+    return;
+  }
+  for (const file of additions) {
+    if (file.size > MAX_CHAT_FILE_BYTES) {
+      showToast(`${file.name} is larger than the 1 MB per-file limit.`);
+      return;
+    }
+  }
+  const totalBytes = learnerFiles.reduce((sum, file) => sum + file.size, 0) +
+    additions.reduce((sum, file) => sum + file.size, 0);
+  if (totalBytes > MAX_CHAT_FILES_BYTES) {
+    showToast("The combined file size must be no more than 5 MB.");
+    return;
+  }
+  learnerFiles.push(...additions);
+  renderLearnerFiles();
+});
+document.querySelector("#learner-chat-form").addEventListener("submit", event => {
+  event.preventDefault();
+  sendLearnerMessage();
+});
+document.querySelector("#learner-chat-input").addEventListener("keydown", event => {
+  if (event.key === "Enter" && !event.shiftKey) {
+    event.preventDefault();
+    document.querySelector("#learner-chat-form").requestSubmit();
+  }
+});
 document.querySelector("#attach-files").addEventListener("click", () => {
   document.querySelector("#chat-file-input").click();
 });
@@ -1908,35 +2254,6 @@ document.querySelectorAll('input[name="response-style"]').forEach(input => {
     settings.responseStyle = input.value;
     saveStored(SETTINGS_STORAGE_KEY, settings);
   });
-});
-const responseLanguage = document.querySelector("#settings-response-language");
-populateLanguageOptions();
-ensureLanguageOption(settings.responseLanguage);
-responseLanguage.value = settings.responseLanguage;
-responseLanguage.addEventListener("change", () => {
-  if (responseLanguage.value === "__custom__") {
-    responseLanguage.value = settings.responseLanguage;
-    document.querySelector("#custom-language-row").hidden = false;
-    document.querySelector("#custom-language-input").focus();
-    return;
-  }
-  document.querySelector("#custom-language-row").hidden = true;
-  changeWebsiteLanguage(responseLanguage.value);
-});
-document.querySelector("#apply-custom-language").addEventListener("click", () => {
-  const customLanguage = normalizeLanguageName(document.querySelector("#custom-language-input").value);
-  if (!isValidLanguageName(customLanguage)) {
-    showToast("Enter a valid language name using letters and spaces.");
-    return;
-  }
-  ensureLanguageOption(customLanguage);
-  changeWebsiteLanguage(customLanguage);
-});
-document.querySelector("#custom-language-input").addEventListener("keydown", event => {
-  if (event.key === "Enter") {
-    event.preventDefault();
-    document.querySelector("#apply-custom-language").click();
-  }
 });
 document.querySelector("#student-form").addEventListener("submit", event => {
   event.preventDefault();
@@ -2304,14 +2621,7 @@ updateClock();
 updateAuthUi();
 observeUiChanges();
 updateSearchProviderCopy();
-if (!settings.responseLanguage.toLowerCase().startsWith("english")) {
-  applyUiLanguage(settings.responseLanguage).catch(error => {
-    console.error("ROBO could not restore the selected website language.", error);
-    showToast(error.message || "ROBO could not translate the website. Please try again.");
-  });
-} else {
-  setDocumentLanguage(settings.responseLanguage);
-}
+setDocumentLanguage("English");
 initializeAuth();
 setInterval(updateClock, 1000);
 setTimeout(hideSplashScreen, 1100);

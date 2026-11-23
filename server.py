@@ -927,6 +927,32 @@ def is_robo_identity_query(query):
     ))
 
 
+def is_story_request(query):
+    return bool(
+        re.search(r"\b(?:story|tale)\b", query, re.IGNORECASE)
+        and re.search(r"\b(?:tell|write|create|make|invent|share|read|give|show)\b", query, re.IGNORECASE)
+    )
+
+
+def offline_story_answer(query):
+    if not (
+        re.search(r"\bmonkeys?\b", query, re.IGNORECASE)
+        and re.search(r"\bcap[- ]?seller\b", query, re.IGNORECASE)
+    ):
+        return None
+    return (
+        "Here's a retelling of the traditional folktale. One warm afternoon, a cap seller "
+        "stopped beneath a tree and fell asleep. A group of curious monkeys climbed down, "
+        "took the colorful caps from his basket, and put them on their heads. When the seller "
+        "woke up, he looked everywhere for the missing caps. Then he noticed the monkeys "
+        "watching him from the branches, each wearing one. The seller scratched his head, "
+        "and the monkeys copied him. He tossed his own cap onto the ground in frustration. "
+        "The monkeys imitated him and tossed their caps down too. Quickly, the seller gathered "
+        "the caps, packed them into his basket, and continued on his way. The seller had solved "
+        "the problem by staying calm and noticing what the monkeys were doing."
+    )
+
+
 def is_coding_request(query):
     mentions_code = re.search(
         r"\b(?:code|program(?:ming)?|script|function|algorithm|debug|implementation)\b",
@@ -1337,6 +1363,7 @@ def generate_gemini_answer(
     response_language="en",
     google_search=False,
     return_sources=False,
+    search_unavailable=False,
 ):
     api_key = os.environ.get("GEMINI_API_KEY", "").strip()
     if not api_key:
@@ -1361,12 +1388,23 @@ def generate_gemini_answer(
         "programming identifiers unchanged. "
         + style_guidance
     )
+    if messages and is_story_request(messages[-1]["text"]):
+        system_instruction += (
+            " When asked for a story, write a complete, engaging narrative rather than a search-results summary. "
+            "Retell named traditional stories in your own words, and never say a story cannot be answered merely "
+            "because web search found no matching results."
+        )
     if google_search:
         system_instruction += (
             " Search Google before answering factual questions. Base factual claims on the search results, "
             "and be clear when the results do not contain a reliable answer. Use the latest user message as "
             "the query; use earlier conversation only to resolve a clear follow-up, and never mix unrelated "
             "older questions into the search."
+        )
+    if search_unavailable:
+        system_instruction += (
+            " No usable web search results were available for this request. Answer from your existing knowledge, clearly "
+            "state uncertainty, and do not claim to have searched or cite sources that were not provided."
         )
     contents = []
     for message in messages:
@@ -1719,8 +1757,36 @@ class RoboHandler(SimpleHTTPRequestHandler):
                         "error": error,
                     })
                 return
+            if is_story_request(query):
+                if api_configured:
+                    try:
+                        answer = generate_gemini_answer(
+                            validated,
+                            payload.get("responseStyle"),
+                            response_language=response_language,
+                        )
+                    except RuntimeError as error:
+                        print(f"Gemini story generation failed: {error}", flush=True)
+                    else:
+                        self.send_json(200, {"text": answer, "sources": []})
+                        return
+                if response_language_name(response_language).lower().startswith("english"):
+                    answer = offline_story_answer(query)
+                    if answer:
+                        self.send_json(200, {"text": answer, "sources": []})
+                        return
+                self.send_json(503, {
+                    "error": "ROBO's story-generation service is unavailable. Please try again later."
+                })
+                return
             if news_request:
-                news = search_news(news_search_query(query))
+                news_search_unavailable = False
+                try:
+                    news = search_news(news_search_query(query))
+                except (RuntimeError, HTTPError, URLError, TimeoutError, ET.ParseError) as error:
+                    news = []
+                    news_search_unavailable = True
+                    print(f"Current-news search failed; continuing with Gemini: {error}", flush=True)
                 if api_configured:
                     try:
                         answer = generate_gemini_answer(
@@ -1728,9 +1794,18 @@ class RoboHandler(SimpleHTTPRequestHandler):
                             payload.get("responseStyle"),
                             news,
                             response_language=response_language,
+                            search_unavailable=news_search_unavailable or not news,
                         )
                     except RuntimeError as error:
                         print(f"Gemini news summary failed; returning live headlines: {error}", flush=True)
+                        if not news:
+                            self.send_json(502, {
+                                "error": (
+                                    "ROBO couldn't verify current headlines because its AI and news "
+                                    "providers are unavailable. Please try again later."
+                                )
+                            })
+                            return
                         answer = answer_from_news(
                             news,
                             "ROBO's AI summary is unavailable, so here are the latest news results I found:",
@@ -1743,6 +1818,14 @@ class RoboHandler(SimpleHTTPRequestHandler):
                         ]
                         self.send_json(200, {"text": answer, "sources": sources})
                 else:
+                    if news_search_unavailable:
+                        self.send_json(502, {
+                            "error": (
+                                "ROBO's current-news provider is unavailable, and Gemini is not configured "
+                                "to generate an answer. Please try again later."
+                            )
+                        })
+                        return
                     self.send_json(200, add_language_fallback_notice(
                         answer_from_news(news),
                         response_language,
@@ -1760,22 +1843,27 @@ class RoboHandler(SimpleHTTPRequestHandler):
                 search_query = f"{recent_questions[-2]} {query}"
             use_google_grounding = api_configured and not google_search_configured()
             search_result = {"items": [], "sources": []}
+            search_unavailable = False
             if not use_google_grounding:
                 try:
                     search_result = search_sources(search_query, include_news=False)
-                except RuntimeError:
+                except (RuntimeError, HTTPError, URLError, TimeoutError, ET.ParseError) as error:
                     if arithmetic is not None:
                         self.send_json(200, arithmetic)
                         return
-                    if not code_example:
+                    if not code_example and not api_configured:
                         raise
-                    print("Web search failed; returning a built-in code example.", flush=True)
-                    answer = {
-                        "text": format_code_example(code_example),
-                        "sources": [],
-                    }
-                    self.send_json(200, add_language_fallback_notice(answer, response_language))
-                    return
+                    if code_example:
+                        print("Web search failed; returning a built-in code example.", flush=True)
+                        answer = {
+                            "text": format_code_example(code_example),
+                            "sources": [],
+                        }
+                        self.send_json(200, add_language_fallback_notice(answer, response_language))
+                        return
+                    search_unavailable = True
+                    print(f"Web search failed; continuing with Gemini: {error}", flush=True)
+                search_unavailable = search_unavailable or not search_result["items"]
             if arithmetic is not None:
                 self.send_json(200, arithmetic)
                 return
@@ -1798,31 +1886,27 @@ class RoboHandler(SimpleHTTPRequestHandler):
                         response_language=response_language,
                         google_search=use_google_grounding,
                         return_sources=True,
+                        search_unavailable=search_unavailable,
                     )
                     answer = generated["text"]
                     sources = generated["sources"]
                     if use_google_grounding and not sources:
-                        search_result = search_sources(search_query, include_news=False)
-                        if code_example:
-                            result = {
-                                "text": format_code_example(code_example),
-                                "sources": (
-                                    [] if code_example.get("suppressSources")
-                                    else search_result["sources"]
-                                ),
-                            }
-                        else:
-                            result = answer_from_web_search(query, search_result)
-                            result["text"] = (
-                                "Google Search did not provide verifiable source links, so here are the closest "
-                                "public search results.\n\n" + result["text"]
-                            )
-                        self.send_json(200, add_language_fallback_notice(result, response_language))
-                        return
+                        answer = (
+                            answer.rstrip()
+                            + "\n\nI couldn't verify this answer with linked web sources."
+                        )
                 except RuntimeError as error:
                     print(f"Gemini answer failed; returning web search results: {error}", flush=True)
                     if use_google_grounding:
                         search_result = search_sources(search_query, include_news=False)
+                    if not code_example and not search_result["items"]:
+                        self.send_json(502, {
+                            "error": (
+                                "ROBO's AI answer service is unavailable and no public search results "
+                                "were found. Please try again later."
+                            )
+                        })
+                        return
                     if code_example:
                         result = {
                             "text": format_code_example(code_example),
@@ -1856,12 +1940,29 @@ class RoboHandler(SimpleHTTPRequestHandler):
                 self.send_json(200, add_language_fallback_notice(answer, response_language))
                 return
             if is_coding_request(query):
+                if not search_result["items"]:
+                    self.send_json(503, {
+                        "error": (
+                            "ROBO cannot generate custom code because Gemini is not configured and "
+                            "public search returned no useful sources. Configure GEMINI_API_KEY on the server."
+                        )
+                    })
+                    return
                 result = answer_from_web_search(query, search_result)
                 result["text"] = (
                     "I searched the web first, but custom code generation needs an available AI model. "
                     "Here are the closest results:\n\n" + result["text"]
                 )
                 self.send_json(200, add_language_fallback_notice(result, response_language))
+                return
+
+            if not search_result["items"]:
+                self.send_json(503, {
+                    "error": (
+                        "ROBO couldn't generate an answer because Gemini is not configured and public search "
+                        "found no matching sources. Configure GEMINI_API_KEY on the server to answer general questions."
+                    )
+                })
                 return
 
             self.send_json(200, add_language_fallback_notice(
